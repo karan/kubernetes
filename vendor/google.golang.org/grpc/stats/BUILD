@@ -6,9 +6,10 @@ go_library(
         "handlers.go",
         "stats.go",
     ],
+    importmap = "k8s.io/kubernetes/vendor/google.golang.org/grpc/stats",
     importpath = "google.golang.org/grpc/stats",
     visibility = ["//visibility:public"],
-    deps = ["//vendor/golang.org/x/net/context:go_default_library"],
+    deps = ["//vendor/google.golang.org/grpc/metadata:go_default_library"],
 )
 
 filegroup(

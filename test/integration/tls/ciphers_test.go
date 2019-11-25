@@ -29,7 +29,7 @@ import (
 
 func runBasicSecureAPIServer(t *testing.T, ciphers []string) (kubeapiservertesting.TearDownFunc, int) {
 	flags := []string{"--tls-cipher-suites", strings.Join(ciphers, ",")}
-	testServer := kubeapiservertesting.StartTestServerOrDie(t, flags, framework.SharedEtcd())
+	testServer := kubeapiservertesting.StartTestServerOrDie(t, nil, flags, framework.SharedEtcd())
 	return testServer.TearDownFn, testServer.ServerOpts.SecureServing.BindPort
 }
 
@@ -64,6 +64,7 @@ func runTestAPICiphers(t *testing.T, testID int, kubePort int, clientCiphers []u
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
+			MaxVersion:         tls.VersionTLS12, // Limit to TLS1.2 to allow cipher configuration
 			InsecureSkipVerify: true,
 			CipherSuites:       clientCiphers,
 		},

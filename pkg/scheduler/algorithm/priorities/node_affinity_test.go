@@ -20,10 +20,10 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
-	"k8s.io/kubernetes/pkg/scheduler/schedulercache"
+	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	nodeinfosnapshot "k8s.io/kubernetes/pkg/scheduler/nodeinfo/snapshot"
 )
 
 func TestNodeAffinityPriority(t *testing.T) {
@@ -104,8 +104,8 @@ func TestNodeAffinityPriority(t *testing.T) {
 	tests := []struct {
 		pod          *v1.Pod
 		nodes        []*v1.Node
-		expectedList schedulerapi.HostPriorityList
-		test         string
+		expectedList framework.NodeScoreList
+		name         string
 	}{
 		{
 			pod: &v1.Pod{
@@ -118,8 +118,8 @@ func TestNodeAffinityPriority(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine2", Labels: label2}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine3", Labels: label3}},
 			},
-			expectedList: []schedulerapi.HostPriority{{Host: "machine1", Score: 0}, {Host: "machine2", Score: 0}, {Host: "machine3", Score: 0}},
-			test:         "all machines are same priority as NodeAffinity is nil",
+			expectedList: []framework.NodeScore{{Name: "machine1", Score: 0}, {Name: "machine2", Score: 0}, {Name: "machine3", Score: 0}},
+			name:         "all machines are same priority as NodeAffinity is nil",
 		},
 		{
 			pod: &v1.Pod{
@@ -132,8 +132,8 @@ func TestNodeAffinityPriority(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine2", Labels: label2}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine3", Labels: label3}},
 			},
-			expectedList: []schedulerapi.HostPriority{{Host: "machine1", Score: 0}, {Host: "machine2", Score: 0}, {Host: "machine3", Score: 0}},
-			test:         "no machine macthes preferred scheduling requirements in NodeAffinity of pod so all machines' priority is zero",
+			expectedList: []framework.NodeScore{{Name: "machine1", Score: 0}, {Name: "machine2", Score: 0}, {Name: "machine3", Score: 0}},
+			name:         "no machine macthes preferred scheduling requirements in NodeAffinity of pod so all machines' priority is zero",
 		},
 		{
 			pod: &v1.Pod{
@@ -146,8 +146,8 @@ func TestNodeAffinityPriority(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine2", Labels: label2}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine3", Labels: label3}},
 			},
-			expectedList: []schedulerapi.HostPriority{{Host: "machine1", Score: schedulerapi.MaxPriority}, {Host: "machine2", Score: 0}, {Host: "machine3", Score: 0}},
-			test:         "only machine1 matches the preferred scheduling requirements of pod",
+			expectedList: []framework.NodeScore{{Name: "machine1", Score: framework.MaxNodeScore}, {Name: "machine2", Score: 0}, {Name: "machine3", Score: 0}},
+			name:         "only machine1 matches the preferred scheduling requirements of pod",
 		},
 		{
 			pod: &v1.Pod{
@@ -160,20 +160,21 @@ func TestNodeAffinityPriority(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine5", Labels: label5}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "machine2", Labels: label2}},
 			},
-			expectedList: []schedulerapi.HostPriority{{Host: "machine1", Score: 1}, {Host: "machine5", Score: schedulerapi.MaxPriority}, {Host: "machine2", Score: 3}},
-			test:         "all machines matches the preferred scheduling requirements of pod but with different priorities ",
+			expectedList: []framework.NodeScore{{Name: "machine1", Score: 18}, {Name: "machine5", Score: framework.MaxNodeScore}, {Name: "machine2", Score: 36}},
+			name:         "all machines matches the preferred scheduling requirements of pod but with different priorities ",
 		},
 	}
 
 	for _, test := range tests {
-		nodeNameToInfo := schedulercache.CreateNodeNameToInfoMap(nil, test.nodes)
-		nap := priorityFunction(CalculateNodeAffinityPriorityMap, CalculateNodeAffinityPriorityReduce, nil)
-		list, err := nap(test.pod, nodeNameToInfo, test.nodes)
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-		if !reflect.DeepEqual(test.expectedList, list) {
-			t.Errorf("%s: \nexpected %#v, \ngot      %#v", test.test, test.expectedList, list)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := nodeinfosnapshot.NewSnapshot(nodeinfosnapshot.CreateNodeInfoMap(nil, test.nodes))
+			list, err := runMapReducePriority(CalculateNodeAffinityPriorityMap, CalculateNodeAffinityPriorityReduce, nil, test.pod, snapshot, test.nodes)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(test.expectedList, list) {
+				t.Errorf("expected %#v, \ngot      %#v", test.expectedList, list)
+			}
+		})
 	}
 }

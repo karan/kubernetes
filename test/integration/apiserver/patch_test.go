@@ -22,18 +22,17 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
 
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apiserver/pkg/endpoints/handlers"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-// Tests that the apiserver retries non-overlapping conflicts on patches
+// Tests that the apiserver retries patches
 func TestPatchConflicts(t *testing.T) {
 	s, clientSet, closeFn := setup(t)
 	defer closeFn()
@@ -41,12 +40,12 @@ func TestPatchConflicts(t *testing.T) {
 	ns := framework.CreateTestingNamespace("status-code", s, t)
 	defer framework.DeleteTestingNamespace(ns, s, t)
 
-	numOfConcurrentPatches := 2 * handlers.MaxRetryWhenPatchConflicts
+	numOfConcurrentPatches := 100
 
 	UIDs := make([]types.UID, numOfConcurrentPatches)
 	ownerRefs := []metav1.OwnerReference{}
 	for i := 0; i < numOfConcurrentPatches; i++ {
-		uid := types.UID(uuid.NewRandom().String())
+		uid := types.UID(uuid.New().String())
 		ownerName := fmt.Sprintf("owner-%d", i)
 		UIDs[i] = uid
 		ownerRefs = append(ownerRefs, metav1.OwnerReference{
@@ -69,17 +68,15 @@ func TestPatchConflicts(t *testing.T) {
 
 	successes := int32(0)
 
-	// Run a lot of simultaneous patch operations to exercise internal API server retry of patch application.
-	// Internally, a patch API call retries up to MaxRetryWhenPatchConflicts times if the resource version of the object has changed.
-	// If the resource version of the object changed between attempts, that means another one of our patch requests succeeded.
-	// That means if we run 2*MaxRetryWhenPatchConflicts patch attempts, we should see at least MaxRetryWhenPatchConflicts succeed.
+	// Run a lot of simultaneous patch operations to exercise internal API server retry of application of patches that do not specify resourceVersion.
+	// They should all succeed.
 	wg := sync.WaitGroup{}
 	for i := 0; i < numOfConcurrentPatches; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			labelName := fmt.Sprintf("label-%d", i)
-			value := uuid.NewRandom().String()
+			value := uuid.New().String()
 
 			obj, err := client.Patch(types.StrategicMergePatchType).
 				Namespace(ns.Name).
@@ -123,8 +120,8 @@ func TestPatchConflicts(t *testing.T) {
 	}
 	wg.Wait()
 
-	if successes < handlers.MaxRetryWhenPatchConflicts {
-		t.Errorf("Expected at least %d successful patches for %s, got %d", handlers.MaxRetryWhenPatchConflicts, "secrets", successes)
+	if successes < int32(numOfConcurrentPatches) {
+		t.Errorf("Expected at least %d successful patches for %s, got %d", numOfConcurrentPatches, "secrets", successes)
 	} else {
 		t.Logf("Got %d successful patches for %s", successes, "secrets")
 	}

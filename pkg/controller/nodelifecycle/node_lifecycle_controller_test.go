@@ -17,34 +17,39 @@ limitations under the License.
 package nodelifecycle
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
-	extensions "k8s.io/api/extensions/v1beta1"
+	apps "k8s.io/api/apps/v1"
+	coordv1 "k8s.io/api/coordination/v1"
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/diff"
-	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
+	appsinformers "k8s.io/client-go/informers/apps/v1"
+	coordinformers "k8s.io/client-go/informers/coordination/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
-	extensionsinformers "k8s.io/client-go/informers/extensions/v1beta1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	testcore "k8s.io/client-go/testing"
-	"k8s.io/kubernetes/pkg/cloudprovider"
-	fakecloud "k8s.io/kubernetes/pkg/cloudprovider/providers/fake"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/nodelifecycle/scheduler"
 	"k8s.io/kubernetes/pkg/controller/testutil"
 	nodeutil "k8s.io/kubernetes/pkg/controller/util/node"
+	"k8s.io/kubernetes/pkg/features"
 	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm"
 	"k8s.io/kubernetes/pkg/util/node"
 	taintutils "k8s.io/kubernetes/pkg/util/taints"
+	"k8s.io/utils/pointer"
 )
 
 const (
@@ -58,31 +63,74 @@ const (
 
 func alwaysReady() bool { return true }
 
+func fakeGetPodsAssignedToNode(c *fake.Clientset) func(string) ([]*v1.Pod, error) {
+	return func(nodeName string) ([]*v1.Pod, error) {
+		selector := fields.SelectorFromSet(fields.Set{"spec.nodeName": nodeName})
+		pods, err := c.CoreV1().Pods(v1.NamespaceAll).List(metav1.ListOptions{
+			FieldSelector: selector.String(),
+			LabelSelector: labels.Everything().String(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get Pods assigned to node %v", nodeName)
+		}
+		rPods := make([]*v1.Pod, len(pods.Items))
+		for i := range pods.Items {
+			rPods[i] = &pods.Items[i]
+		}
+		return rPods, nil
+	}
+}
+
 type nodeLifecycleController struct {
 	*Controller
+	leaseInformer     coordinformers.LeaseInformer
 	nodeInformer      coreinformers.NodeInformer
-	daemonSetInformer extensionsinformers.DaemonSetInformer
+	daemonSetInformer appsinformers.DaemonSetInformer
 }
 
 // doEviction does the fake eviction and returns the status of eviction operation.
 func (nc *nodeLifecycleController) doEviction(fakeNodeHandler *testutil.FakeNodeHandler) bool {
-	var podEvicted bool
+	nc.evictorLock.Lock()
+	defer nc.evictorLock.Unlock()
 	zones := testutil.GetZones(fakeNodeHandler)
 	for _, zone := range zones {
 		nc.zonePodEvictor[zone].Try(func(value scheduler.TimedValue) (bool, time.Duration) {
 			uid, _ := value.UID.(string)
-			nodeutil.DeletePods(fakeNodeHandler, nc.recorder, value.Value, uid, nc.daemonSetStore)
+			pods, _ := nc.getPodsAssignedToNode(value.Value)
+			nodeutil.DeletePods(fakeNodeHandler, pods, nc.recorder, value.Value, uid, nc.daemonSetStore)
+			_ = nc.nodeEvictionMap.setStatus(value.Value, evicted)
 			return true, 0
 		})
 	}
 
 	for _, action := range fakeNodeHandler.Actions() {
 		if action.GetVerb() == "delete" && action.GetResource().Resource == "pods" {
-			podEvicted = true
-			return podEvicted
+			return true
 		}
 	}
-	return podEvicted
+	return false
+}
+
+func createNodeLease(nodeName string, renewTime metav1.MicroTime) *coordv1.Lease {
+	return &coordv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      nodeName,
+			Namespace: v1.NamespaceNodeLease,
+		},
+		Spec: coordv1.LeaseSpec{
+			HolderIdentity: pointer.StringPtr(nodeName),
+			RenewTime:      &renewTime,
+		},
+	}
+}
+
+func (nc *nodeLifecycleController) syncLeaseStore(lease *coordv1.Lease) error {
+	if lease == nil {
+		return nil
+	}
+	newElems := make([]interface{}, 0, 1)
+	newElems = append(newElems, lease)
+	return nc.leaseInformer.Informer().GetStore().Replace(newElems, "newRV")
 }
 
 func (nc *nodeLifecycleController) syncNodeStore(fakeNodeHandler *testutil.FakeNodeHandler) error {
@@ -98,7 +146,6 @@ func (nc *nodeLifecycleController) syncNodeStore(fakeNodeHandler *testutil.FakeN
 }
 
 func newNodeLifecycleControllerFromClient(
-	cloud cloudprovider.Interface,
 	kubeClient clientset.Interface,
 	podEvictionTimeout time.Duration,
 	evictionLimiterQPS float32,
@@ -113,14 +160,15 @@ func newNodeLifecycleControllerFromClient(
 
 	factory := informers.NewSharedInformerFactory(kubeClient, controller.NoResyncPeriodFunc())
 
+	leaseInformer := factory.Coordination().V1().Leases()
 	nodeInformer := factory.Core().V1().Nodes()
-	daemonSetInformer := factory.Extensions().V1beta1().DaemonSets()
+	daemonSetInformer := factory.Apps().V1().DaemonSets()
 
 	nc, err := NewNodeLifecycleController(
+		leaseInformer,
 		factory.Core().V1().Pods(),
 		nodeInformer,
 		daemonSetInformer,
-		cloud,
 		kubeClient,
 		nodeMonitorPeriod,
 		nodeStartupGracePeriod,
@@ -132,25 +180,27 @@ func newNodeLifecycleControllerFromClient(
 		unhealthyZoneThreshold,
 		useTaints,
 		useTaints,
-		useTaints,
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	nc.leaseInformerSynced = alwaysReady
 	nc.podInformerSynced = alwaysReady
 	nc.nodeInformerSynced = alwaysReady
 	nc.daemonSetInformerSynced = alwaysReady
 
-	return &nodeLifecycleController{nc, nodeInformer, daemonSetInformer}, nil
+	return &nodeLifecycleController{nc, leaseInformer, nodeInformer, daemonSetInformer}, nil
 }
 
-func TestMonitorNodeStatusEvictPods(t *testing.T) {
+func TestMonitorNodeHealthEvictPods(t *testing.T) {
 	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
 	evictionTimeout := 10 * time.Minute
 	labels := map[string]string{
-		kubeletapis.LabelZoneRegion:        "region1",
-		kubeletapis.LabelZoneFailureDomain: "zone1",
+		v1.LabelZoneRegionStable:        "region1",
+		v1.LabelZoneFailureDomainStable: "zone1",
+		v1.LabelZoneRegion:              "region1",
+		v1.LabelZoneFailureDomain:       "zone1",
 	}
 
 	// Because of the logic that prevents NC from evicting anything when all Nodes are NotReady
@@ -170,7 +220,7 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 
 	table := []struct {
 		fakeNodeHandler     *testutil.FakeNodeHandler
-		daemonSets          []extensions.DaemonSet
+		daemonSets          []apps.DaemonSet
 		timeToPass          time.Duration
 		newNodeStatus       v1.NodeStatus
 		secondNodeNewStatus v1.NodeStatus
@@ -186,8 +236,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node0",
 							CreationTimestamp: fakeNow,
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 					},
@@ -196,8 +248,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node1",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -266,8 +320,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node0",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -286,8 +342,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node1",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -330,8 +388,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node0",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -350,8 +410,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node1",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -383,13 +445,13 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 					},
 				),
 			},
-			daemonSets: []extensions.DaemonSet{
+			daemonSets: []apps.DaemonSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "ds0",
 						Namespace: "default",
 					},
-					Spec: extensions.DaemonSetSpec{
+					Spec: apps.DaemonSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{"daemon": "yes"},
 						},
@@ -421,8 +483,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node0",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -441,8 +505,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node1",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -485,8 +551,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node0",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -505,8 +573,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node1",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -549,8 +619,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node0",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -569,8 +641,10 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 							Name:              "node1",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -608,7 +682,6 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 
 	for _, item := range table {
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			nil,
 			item.fakeNodeHandler,
 			evictionTimeout,
 			testRateLimiterQPS,
@@ -621,13 +694,14 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 			false)
 		nodeController.now = func() metav1.Time { return fakeNow }
 		nodeController.recorder = testutil.NewFakeRecorder()
+		nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(item.fakeNodeHandler.Clientset)
 		for _, ds := range item.daemonSets {
 			nodeController.daemonSetInformer.Informer().GetStore().Add(&ds)
 		}
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		if item.timeToPass > 0 {
@@ -642,7 +716,7 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		zones := testutil.GetZones(item.fakeNodeHandler)
@@ -650,7 +724,12 @@ func TestMonitorNodeStatusEvictPods(t *testing.T) {
 			if _, ok := nodeController.zonePodEvictor[zone]; ok {
 				nodeController.zonePodEvictor[zone].Try(func(value scheduler.TimedValue) (bool, time.Duration) {
 					nodeUID, _ := value.UID.(string)
-					nodeutil.DeletePods(item.fakeNodeHandler, nodeController.recorder, value.Value, nodeUID, nodeController.daemonSetInformer.Lister())
+					pods, err := nodeController.getPodsAssignedToNode(value.Value)
+					if err != nil {
+						t.Errorf("unexpected error: %v", err)
+					}
+					t.Logf("listed pods %d for node %v", len(pods), value.Value)
+					nodeutil.DeletePods(item.fakeNodeHandler, pods, nodeController.recorder, value.Value, nodeUID, nodeController.daemonSetInformer.Lister())
 					return true, 0
 				})
 			} else {
@@ -694,7 +773,6 @@ func TestPodStatusChange(t *testing.T) {
 	// Node created long time ago, node controller posted Unknown for a long period of time.
 	table := []struct {
 		fakeNodeHandler     *testutil.FakeNodeHandler
-		daemonSets          []extensions.DaemonSet
 		timeToPass          time.Duration
 		newNodeStatus       v1.NodeStatus
 		secondNodeNewStatus v1.NodeStatus
@@ -710,8 +788,10 @@ func TestPodStatusChange(t *testing.T) {
 							Name:              "node0",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegionStable:        "region1",
+								v1.LabelZoneFailureDomainStable: "zone1",
+								v1.LabelZoneRegion:              "region1",
+								v1.LabelZoneFailureDomain:       "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -730,8 +810,8 @@ func TestPodStatusChange(t *testing.T) {
 							Name:              "node1",
 							CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 							Labels: map[string]string{
-								kubeletapis.LabelZoneRegion:        "region1",
-								kubeletapis.LabelZoneFailureDomain: "zone1",
+								v1.LabelZoneRegion:        "region1",
+								v1.LabelZoneFailureDomain: "zone1",
 							},
 						},
 						Status: v1.NodeStatus{
@@ -770,7 +850,6 @@ func TestPodStatusChange(t *testing.T) {
 
 	for _, item := range table {
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			nil,
 			item.fakeNodeHandler,
 			evictionTimeout,
 			testRateLimiterQPS,
@@ -783,10 +862,11 @@ func TestPodStatusChange(t *testing.T) {
 			false)
 		nodeController.now = func() metav1.Time { return fakeNow }
 		nodeController.recorder = testutil.NewFakeRecorder()
+		nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(item.fakeNodeHandler.Clientset)
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		if item.timeToPass > 0 {
@@ -797,14 +877,18 @@ func TestPodStatusChange(t *testing.T) {
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		zones := testutil.GetZones(item.fakeNodeHandler)
 		for _, zone := range zones {
 			nodeController.zonePodEvictor[zone].Try(func(value scheduler.TimedValue) (bool, time.Duration) {
 				nodeUID, _ := value.UID.(string)
-				nodeutil.DeletePods(item.fakeNodeHandler, nodeController.recorder, value.Value, nodeUID, nodeController.daemonSetStore)
+				pods, err := nodeController.getPodsAssignedToNode(value.Value)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				nodeutil.DeletePods(item.fakeNodeHandler, pods, nodeController.recorder, value.Value, nodeUID, nodeController.daemonSetStore)
 				return true, 0
 			})
 		}
@@ -821,12 +905,12 @@ func TestPodStatusChange(t *testing.T) {
 		}
 
 		if podReasonUpdate != item.expectedPodUpdate {
-			t.Errorf("expected pod update: %+v, got %+v for %+v", podReasonUpdate, item.expectedPodUpdate, item.description)
+			t.Errorf("expected pod update: %+v, got %+v for %+v", item.expectedPodUpdate, podReasonUpdate, item.description)
 		}
 	}
 }
 
-func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
+func TestMonitorNodeHealthEvictPodsWithDisruption(t *testing.T) {
 	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
 	evictionTimeout := 10 * time.Minute
 	timeToPass := 60 * time.Minute
@@ -874,8 +958,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node0",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -894,8 +980,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node1",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -929,8 +1017,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node0",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -949,8 +1039,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node1",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region2",
-							kubeletapis.LabelZoneFailureDomain: "zone2",
+							v1.LabelZoneRegionStable:        "region2",
+							v1.LabelZoneFailureDomainStable: "zone2",
+							v1.LabelZoneRegion:              "region2",
+							v1.LabelZoneFailureDomain:       "zone2",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -991,8 +1083,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node0",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1011,8 +1105,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node1",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone2",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone2",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone2",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1052,8 +1148,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node0",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1072,8 +1170,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node-master",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1111,8 +1211,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node0",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1131,8 +1233,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node1",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone2",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone2",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone2",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1173,8 +1277,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node0",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1193,8 +1299,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node1",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1213,8 +1321,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node2",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1233,8 +1343,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node3",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1253,8 +1365,10 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 						Name:              "node4",
 						CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 						Labels: map[string]string{
-							kubeletapis.LabelZoneRegion:        "region1",
-							kubeletapis.LabelZoneFailureDomain: "zone1",
+							v1.LabelZoneRegionStable:        "region1",
+							v1.LabelZoneFailureDomainStable: "zone1",
+							v1.LabelZoneRegion:              "region1",
+							v1.LabelZoneFailureDomain:       "zone1",
 						},
 					},
 					Status: v1.NodeStatus{
@@ -1295,7 +1409,6 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 			Clientset: fake.NewSimpleClientset(&v1.PodList{Items: item.podList}),
 		}
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			nil,
 			fakeNodeHandler,
 			evictionTimeout,
 			testRateLimiterQPS,
@@ -1307,17 +1420,18 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 			testNodeMonitorPeriod,
 			false)
 		nodeController.now = func() metav1.Time { return fakeNow }
+		nodeController.recorder = testutil.NewFakeRecorder()
+		nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
 		nodeController.enterPartialDisruptionFunc = func(nodeNum int) float32 {
 			return testRateLimiterQPS
 		}
-		nodeController.recorder = testutil.NewFakeRecorder()
 		nodeController.enterFullDisruptionFunc = func(nodeNum int) float32 {
 			return testRateLimiterQPS
 		}
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("%v: unexpected error: %v", item.description, err)
 		}
 
@@ -1335,7 +1449,7 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("%v: unexpected error: %v", item.description, err)
 		}
 		for zone, state := range item.expectedFollowingStates {
@@ -1360,79 +1474,15 @@ func TestMonitorNodeStatusEvictPodsWithDisruption(t *testing.T) {
 	}
 }
 
-// TestCloudProviderNoRateLimit tests that monitorNodes() immediately deletes
-// pods and the node when kubelet has not reported, and the cloudprovider says
-// the node is gone.
-func TestCloudProviderNoRateLimit(t *testing.T) {
-	fnh := &testutil.FakeNodeHandler{
-		Existing: []*v1.Node{
-			{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:              "node0",
-					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
-				},
-				Status: v1.NodeStatus{
-					Conditions: []v1.NodeCondition{
-						{
-							Type:               v1.NodeReady,
-							Status:             v1.ConditionUnknown,
-							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-						},
-					},
-				},
-			},
-		},
-		Clientset:      fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0"), *testutil.NewPod("pod1", "node0")}}),
-		DeleteWaitChan: make(chan struct{}),
-	}
-	nodeController, _ := newNodeLifecycleControllerFromClient(
-		nil,
-		fnh,
-		10*time.Minute,
-		testRateLimiterQPS,
-		testRateLimiterQPS,
-		testLargeClusterThreshold,
-		testUnhealthyThreshold,
-		testNodeMonitorGracePeriod,
-		testNodeStartupGracePeriod,
-		testNodeMonitorPeriod,
-		false)
-	nodeController.cloud = &fakecloud.FakeCloud{}
-	nodeController.now = func() metav1.Time { return metav1.Date(2016, 1, 1, 12, 0, 0, 0, time.UTC) }
-	nodeController.recorder = testutil.NewFakeRecorder()
-	nodeController.nodeExistsInCloudProvider = func(nodeName types.NodeName) (bool, error) {
-		return false, nil
-	}
-	// monitorNodeStatus should allow this node to be immediately deleted
-	if err := nodeController.syncNodeStore(fnh); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if err := nodeController.monitorNodeStatus(); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	select {
-	case <-fnh.DeleteWaitChan:
-	case <-time.After(wait.ForeverTestTimeout):
-		t.Errorf("Timed out waiting %v for node to be deleted", wait.ForeverTestTimeout)
-	}
-	if len(fnh.DeletedNodes) != 1 || fnh.DeletedNodes[0].Name != "node0" {
-		t.Errorf("Node was not deleted")
-	}
-	if nodeOnQueue := nodeController.zonePodEvictor[""].Remove("node0"); nodeOnQueue {
-		t.Errorf("Node was queued for eviction. Should have been immediately deleted.")
-	}
-}
-
-func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
+func TestMonitorNodeHealthUpdateStatus(t *testing.T) {
 	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
 	table := []struct {
-		fakeNodeHandler      *testutil.FakeNodeHandler
-		timeToPass           time.Duration
-		newNodeStatus        v1.NodeStatus
-		expectedEvictPods    bool
-		expectedRequestCount int
-		expectedNodes        []*v1.Node
+		fakeNodeHandler         *testutil.FakeNodeHandler
+		timeToPass              time.Duration
+		newNodeStatus           v1.NodeStatus
+		expectedRequestCount    int
+		expectedNodes           []*v1.Node
+		expectedPodStatusUpdate bool
 	}{
 		// Node created long time ago, without status:
 		// Expect Unknown status posted from node controller.
@@ -1466,14 +1516,6 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 								LastTransitionTime: fakeNow,
 							},
 							{
-								Type:               v1.NodeOutOfDisk,
-								Status:             v1.ConditionUnknown,
-								Reason:             "NodeStatusNeverUpdated",
-								Message:            "Kubelet never posted node status.",
-								LastHeartbeatTime:  metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
-								LastTransitionTime: fakeNow,
-							},
-							{
 								Type:               v1.NodeMemoryPressure,
 								Status:             v1.ConditionUnknown,
 								Reason:             "NodeStatusNeverUpdated",
@@ -1489,10 +1531,19 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 								LastHeartbeatTime:  metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 								LastTransitionTime: fakeNow,
 							},
+							{
+								Type:               v1.NodePIDPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+								LastTransitionTime: fakeNow,
+							},
 						},
 					},
 				},
 			},
+			expectedPodStatusUpdate: false, // Pod was never scheduled
 		},
 		// Node created recently, without status.
 		// Expect no action from node controller (within startup grace period).
@@ -1508,8 +1559,9 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
 			},
-			expectedRequestCount: 1, // List
-			expectedNodes:        nil,
+			expectedRequestCount:    1, // List
+			expectedNodes:           nil,
+			expectedPodStatusUpdate: false,
 		},
 		// Node created long time ago, with status updated by kubelet exceeds grace period.
 		// Expect Unknown status posted from node controller.
@@ -1530,21 +1582,11 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 									LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
 									LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
 								},
-								{
-									Type:   v1.NodeOutOfDisk,
-									Status: v1.ConditionFalse,
-									// Node status hasn't been updated for 1hr.
-									LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-									LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-								},
 							},
 							Capacity: v1.ResourceList{
 								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
 								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 							},
-						},
-						Spec: v1.NodeSpec{
-							ExternalID: "node0",
 						},
 					},
 				},
@@ -1557,13 +1599,6 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 					{
 						Type:   v1.NodeReady,
 						Status: v1.ConditionTrue,
-						// Node status hasn't been updated for 1hr.
-						LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-						LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-					},
-					{
-						Type:   v1.NodeOutOfDisk,
-						Status: v1.ConditionFalse,
 						// Node status hasn't been updated for 1hr.
 						LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
 						LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
@@ -1591,14 +1626,6 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 								LastTransitionTime: metav1.Time{Time: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC).Add(time.Hour)},
 							},
 							{
-								Type:               v1.NodeOutOfDisk,
-								Status:             v1.ConditionUnknown,
-								Reason:             "NodeStatusUnknown",
-								Message:            "Kubelet stopped posting node status.",
-								LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-								LastTransitionTime: metav1.Time{Time: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC).Add(time.Hour)},
-							},
-							{
 								Type:               v1.NodeMemoryPressure,
 								Status:             v1.ConditionUnknown,
 								Reason:             "NodeStatusNeverUpdated",
@@ -1614,17 +1641,23 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 								LastHeartbeatTime:  metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC), // should default to node creation time if condition was never updated
 								LastTransitionTime: metav1.Time{Time: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC).Add(time.Hour)},
 							},
+							{
+								Type:               v1.NodePIDPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC), // should default to node creation time if condition was never updated
+								LastTransitionTime: metav1.Time{Time: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC).Add(time.Hour)},
+							},
 						},
 						Capacity: v1.ResourceList{
 							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
 							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 						},
 					},
-					Spec: v1.NodeSpec{
-						ExternalID: "node0",
-					},
 				},
 			},
+			expectedPodStatusUpdate: true,
 		},
 		// Node created long time ago, with status updated recently.
 		// Expect no action from node controller (within monitor grace period).
@@ -1651,21 +1684,17 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 							},
 						},
-						Spec: v1.NodeSpec{
-							ExternalID: "node0",
-						},
 					},
 				},
 				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
 			},
-			expectedRequestCount: 1, // List
-			expectedNodes:        nil,
+			expectedRequestCount:    1, // List
+			expectedNodes:           nil,
+			expectedPodStatusUpdate: false,
 		},
 	}
-
 	for i, item := range table {
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			nil,
 			item.fakeNodeHandler,
 			5*time.Minute,
 			testRateLimiterQPS,
@@ -1678,10 +1707,11 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 			false)
 		nodeController.now = func() metav1.Time { return fakeNow }
 		nodeController.recorder = testutil.NewFakeRecorder()
+		nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(item.fakeNodeHandler.Clientset)
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		if item.timeToPass > 0 {
@@ -1690,7 +1720,7 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 			if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
-			if err := nodeController.monitorNodeStatus(); err != nil {
+			if err := nodeController.monitorNodeHealth(); err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
 		}
@@ -1703,10 +1733,570 @@ func TestMonitorNodeStatusUpdateStatus(t *testing.T) {
 		if len(item.fakeNodeHandler.UpdatedNodeStatuses) > 0 && !apiequality.Semantic.DeepEqual(item.expectedNodes, item.fakeNodeHandler.UpdatedNodeStatuses) {
 			t.Errorf("Case[%d] unexpected nodes: %s", i, diff.ObjectDiff(item.expectedNodes[0], item.fakeNodeHandler.UpdatedNodeStatuses[0]))
 		}
+
+		podStatusUpdated := false
+		for _, action := range item.fakeNodeHandler.Actions() {
+			if action.GetVerb() == "update" && action.GetResource().Resource == "pods" && action.GetSubresource() == "status" {
+				podStatusUpdated = true
+			}
+		}
+		if podStatusUpdated != item.expectedPodStatusUpdate {
+			t.Errorf("Case[%d] expect pod status updated to be %v, but got %v", i, item.expectedPodStatusUpdate, podStatusUpdated)
+		}
 	}
 }
 
-func TestMonitorNodeStatusMarkPodsNotReady(t *testing.T) {
+func TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease(t *testing.T) {
+	nodeCreationTime := metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC)
+	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
+	testcases := []struct {
+		description             string
+		fakeNodeHandler         *testutil.FakeNodeHandler
+		lease                   *coordv1.Lease
+		timeToPass              time.Duration
+		newNodeStatus           v1.NodeStatus
+		newLease                *coordv1.Lease
+		expectedRequestCount    int
+		expectedNodes           []*v1.Node
+		expectedPodStatusUpdate bool
+	}{
+		// Node created recently, without status. Node lease is missing.
+		// Expect no action from node controller (within startup grace period).
+		{
+			description: "Node created recently, without status. Node lease is missing.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: fakeNow,
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			expectedRequestCount:    1, // List
+			expectedNodes:           nil,
+			expectedPodStatusUpdate: false,
+		},
+		// Node created recently, without status. Node lease is renewed recently.
+		// Expect no action from node controller (within startup grace period).
+		{
+			description: "Node created recently, without status. Node lease is renewed recently.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: fakeNow,
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease:                   createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)),
+			expectedRequestCount:    1, // List
+			expectedNodes:           nil,
+			expectedPodStatusUpdate: false,
+		},
+		// Node created long time ago, without status. Node lease is missing.
+		// Expect Unknown status posted from node controller.
+		{
+			description: "Node created long time ago, without status. Node lease is missing.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			expectedRequestCount: 2, // List+Update
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+					Status: v1.NodeStatus{
+						Conditions: []v1.NodeCondition{
+							{
+								Type:               v1.NodeReady,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: fakeNow,
+							},
+							{
+								Type:               v1.NodeMemoryPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: fakeNow,
+							},
+							{
+								Type:               v1.NodeDiskPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: fakeNow,
+							},
+							{
+								Type:               v1.NodePIDPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: fakeNow,
+							},
+						},
+					},
+				},
+			},
+			expectedPodStatusUpdate: false, // Pod was never scheduled because the node was never ready.
+		},
+		// Node created long time ago, without status. Node lease is renewed recently.
+		// Expect no action from node controller (within monitor grace period).
+		{
+			description: "Node created long time ago, without status. Node lease is renewed recently.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease:                createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)),
+			timeToPass:           time.Hour,
+			newLease:             createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time.Add(time.Hour))), // Lease is renewed after 1 hour.
+			expectedRequestCount: 2,                                                                          // List+List
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+				},
+			},
+			expectedPodStatusUpdate: false,
+		},
+		// Node created long time ago, without status. Node lease is expired.
+		// Expect Unknown status posted from node controller.
+		{
+			description: "Node created long time ago, without status. Node lease is expired.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease:                createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)),
+			timeToPass:           time.Hour,
+			newLease:             createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)), // Lease is not renewed after 1 hour.
+			expectedRequestCount: 3,                                                           // List+List+Update
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+					Status: v1.NodeStatus{
+						Conditions: []v1.NodeCondition{
+							{
+								Type:               v1.NodeReady,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+							{
+								Type:               v1.NodeMemoryPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+							{
+								Type:               v1.NodeDiskPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+							{
+								Type:               v1.NodePIDPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime,
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+						},
+					},
+				},
+			},
+			expectedPodStatusUpdate: false,
+		},
+		// Node created long time ago, with status updated by kubelet exceeds grace period. Node lease is renewed.
+		// Expect no action from node controller (within monitor grace period).
+		{
+			description: "Node created long time ago, with status updated by kubelet exceeds grace period. Node lease is renewed.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionTrue,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+								{
+									Type:               v1.NodeDiskPressure,
+									Status:             v1.ConditionFalse,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+							Capacity: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease:                createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)),
+			expectedRequestCount: 2, // List+List
+			timeToPass:           time.Hour,
+			newNodeStatus: v1.NodeStatus{
+				// Node status hasn't been updated for 1 hour.
+				Conditions: []v1.NodeCondition{
+					{
+						Type:               v1.NodeReady,
+						Status:             v1.ConditionTrue,
+						LastHeartbeatTime:  fakeNow,
+						LastTransitionTime: fakeNow,
+					},
+					{
+						Type:               v1.NodeDiskPressure,
+						Status:             v1.ConditionFalse,
+						LastHeartbeatTime:  fakeNow,
+						LastTransitionTime: fakeNow,
+					},
+				},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+				},
+			},
+			newLease: createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time.Add(time.Hour))), // Lease is renewed after 1 hour.
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+					Status: v1.NodeStatus{
+						Conditions: []v1.NodeCondition{
+							{
+								Type:               v1.NodeReady,
+								Status:             v1.ConditionTrue,
+								LastHeartbeatTime:  fakeNow,
+								LastTransitionTime: fakeNow,
+							},
+							{
+								Type:               v1.NodeDiskPressure,
+								Status:             v1.ConditionFalse,
+								LastHeartbeatTime:  fakeNow,
+								LastTransitionTime: fakeNow,
+							},
+						},
+						Capacity: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+						},
+					},
+				},
+			},
+			expectedPodStatusUpdate: false,
+		},
+		// Node created long time ago, with status updated by kubelet recently. Node lease is expired.
+		// Expect no action from node controller (within monitor grace period).
+		{
+			description: "Node created long time ago, with status updated by kubelet recently. Node lease is expired.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionTrue,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+								{
+									Type:               v1.NodeDiskPressure,
+									Status:             v1.ConditionFalse,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+							Capacity: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease:                createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)),
+			expectedRequestCount: 2, // List+List
+			timeToPass:           time.Hour,
+			newNodeStatus: v1.NodeStatus{
+				// Node status is updated after 1 hour.
+				Conditions: []v1.NodeCondition{
+					{
+						Type:               v1.NodeReady,
+						Status:             v1.ConditionTrue,
+						LastHeartbeatTime:  metav1.Time{Time: fakeNow.Add(time.Hour)},
+						LastTransitionTime: fakeNow,
+					},
+					{
+						Type:               v1.NodeDiskPressure,
+						Status:             v1.ConditionFalse,
+						LastHeartbeatTime:  metav1.Time{Time: fakeNow.Add(time.Hour)},
+						LastTransitionTime: fakeNow,
+					},
+				},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+				},
+			},
+			newLease: createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)), // Lease is not renewed after 1 hour.
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+					Status: v1.NodeStatus{
+						Conditions: []v1.NodeCondition{
+							{
+								Type:               v1.NodeReady,
+								Status:             v1.ConditionTrue,
+								LastHeartbeatTime:  metav1.Time{Time: fakeNow.Add(time.Hour)},
+								LastTransitionTime: fakeNow,
+							},
+							{
+								Type:               v1.NodeDiskPressure,
+								Status:             v1.ConditionFalse,
+								LastHeartbeatTime:  metav1.Time{Time: fakeNow.Add(time.Hour)},
+								LastTransitionTime: fakeNow,
+							},
+						},
+						Capacity: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+						},
+					},
+				},
+			},
+			expectedPodStatusUpdate: false,
+		},
+		// Node created long time ago, with status updated by kubelet exceeds grace period. Node lease is also expired.
+		// Expect Unknown status posted from node controller.
+		{
+			description: "Node created long time ago, with status updated by kubelet exceeds grace period. Node lease is also expired.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionTrue,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+							Capacity: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease:                createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)),
+			expectedRequestCount: 3, // List+List+Update
+			timeToPass:           time.Hour,
+			newNodeStatus: v1.NodeStatus{
+				// Node status hasn't been updated for 1 hour.
+				Conditions: []v1.NodeCondition{
+					{
+						Type:               v1.NodeReady,
+						Status:             v1.ConditionTrue,
+						LastHeartbeatTime:  fakeNow,
+						LastTransitionTime: fakeNow,
+					},
+				},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+				},
+			},
+			newLease: createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)), // Lease is not renewed after 1 hour.
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+					Status: v1.NodeStatus{
+						Conditions: []v1.NodeCondition{
+							{
+								Type:               v1.NodeReady,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusUnknown",
+								Message:            "Kubelet stopped posting node status.",
+								LastHeartbeatTime:  fakeNow,
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+							{
+								Type:               v1.NodeMemoryPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime, // should default to node creation time if condition was never updated
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+							{
+								Type:               v1.NodeDiskPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime, // should default to node creation time if condition was never updated
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+							{
+								Type:               v1.NodePIDPressure,
+								Status:             v1.ConditionUnknown,
+								Reason:             "NodeStatusNeverUpdated",
+								Message:            "Kubelet never posted node status.",
+								LastHeartbeatTime:  nodeCreationTime, // should default to node creation time if condition was never updated
+								LastTransitionTime: metav1.Time{Time: fakeNow.Add(time.Hour)},
+							},
+						},
+						Capacity: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+						},
+					},
+				},
+			},
+			expectedPodStatusUpdate: true,
+		},
+	}
+
+	for _, item := range testcases {
+		t.Run(item.description, func(t *testing.T) {
+			nodeController, _ := newNodeLifecycleControllerFromClient(
+				item.fakeNodeHandler,
+				5*time.Minute,
+				testRateLimiterQPS,
+				testRateLimiterQPS,
+				testLargeClusterThreshold,
+				testUnhealthyThreshold,
+				testNodeMonitorGracePeriod,
+				testNodeStartupGracePeriod,
+				testNodeMonitorPeriod,
+				false)
+			nodeController.now = func() metav1.Time { return fakeNow }
+			nodeController.recorder = testutil.NewFakeRecorder()
+			nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(item.fakeNodeHandler.Clientset)
+			if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err := nodeController.syncLeaseStore(item.lease); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err := nodeController.monitorNodeHealth(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if item.timeToPass > 0 {
+				nodeController.now = func() metav1.Time { return metav1.Time{Time: fakeNow.Add(item.timeToPass)} }
+				item.fakeNodeHandler.Existing[0].Status = item.newNodeStatus
+				if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := nodeController.syncLeaseStore(item.newLease); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := nodeController.monitorNodeHealth(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+			if item.expectedRequestCount != item.fakeNodeHandler.RequestCount {
+				t.Errorf("expected %v call, but got %v.", item.expectedRequestCount, item.fakeNodeHandler.RequestCount)
+			}
+			if len(item.fakeNodeHandler.UpdatedNodes) > 0 && !apiequality.Semantic.DeepEqual(item.expectedNodes, item.fakeNodeHandler.UpdatedNodes) {
+				t.Errorf("unexpected nodes: %s", diff.ObjectDiff(item.expectedNodes[0], item.fakeNodeHandler.UpdatedNodes[0]))
+			}
+			if len(item.fakeNodeHandler.UpdatedNodeStatuses) > 0 && !apiequality.Semantic.DeepEqual(item.expectedNodes, item.fakeNodeHandler.UpdatedNodeStatuses) {
+				t.Errorf("unexpected nodes: %s", diff.ObjectDiff(item.expectedNodes[0], item.fakeNodeHandler.UpdatedNodeStatuses[0]))
+			}
+
+			podStatusUpdated := false
+			for _, action := range item.fakeNodeHandler.Actions() {
+				if action.GetVerb() == "update" && action.GetResource().Resource == "pods" && action.GetSubresource() == "status" {
+					podStatusUpdated = true
+				}
+			}
+			if podStatusUpdated != item.expectedPodStatusUpdate {
+				t.Errorf("expect pod status updated to be %v, but got %v", item.expectedPodStatusUpdate, podStatusUpdated)
+			}
+		})
+	}
+}
+
+func TestMonitorNodeHealthMarkPodsNotReady(t *testing.T) {
 	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
 	table := []struct {
 		fakeNodeHandler         *testutil.FakeNodeHandler
@@ -1755,9 +2345,6 @@ func TestMonitorNodeStatusMarkPodsNotReady(t *testing.T) {
 								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 							},
 						},
-						Spec: v1.NodeSpec{
-							ExternalID: "node0",
-						},
 					},
 				},
 				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
@@ -1789,9 +2376,6 @@ func TestMonitorNodeStatusMarkPodsNotReady(t *testing.T) {
 								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 							},
 						},
-						Spec: v1.NodeSpec{
-							ExternalID: "node0",
-						},
 					},
 				},
 				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
@@ -1818,7 +2402,6 @@ func TestMonitorNodeStatusMarkPodsNotReady(t *testing.T) {
 
 	for i, item := range table {
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			nil,
 			item.fakeNodeHandler,
 			5*time.Minute,
 			testRateLimiterQPS,
@@ -1831,10 +2414,11 @@ func TestMonitorNodeStatusMarkPodsNotReady(t *testing.T) {
 			false)
 		nodeController.now = func() metav1.Time { return fakeNow }
 		nodeController.recorder = testutil.NewFakeRecorder()
+		nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(item.fakeNodeHandler.Clientset)
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeStatus(); err != nil {
+		if err := nodeController.monitorNodeHealth(); err != nil {
 			t.Errorf("Case[%d] unexpected error: %v", i, err)
 		}
 		if item.timeToPass > 0 {
@@ -1843,7 +2427,7 @@ func TestMonitorNodeStatusMarkPodsNotReady(t *testing.T) {
 			if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
-			if err := nodeController.monitorNodeStatus(); err != nil {
+			if err := nodeController.monitorNodeHealth(); err != nil {
 				t.Errorf("Case[%d] unexpected error: %v", i, err)
 			}
 		}
@@ -1860,6 +2444,344 @@ func TestMonitorNodeStatusMarkPodsNotReady(t *testing.T) {
 	}
 }
 
+func TestMonitorNodeHealthMarkPodsNotReadyRetry(t *testing.T) {
+	type nodeIteration struct {
+		timeToPass time.Duration
+		newNodes   []*v1.Node
+	}
+	timeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
+	timePlusTwoMinutes := metav1.Date(2015, 1, 1, 12, 0, 2, 0, time.UTC)
+	makeNodes := func(status v1.ConditionStatus, lastHeartbeatTime, lastTransitionTime metav1.Time) []*v1.Node {
+		return []*v1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: timeNow,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             status,
+							LastHeartbeatTime:  lastHeartbeatTime,
+							LastTransitionTime: lastTransitionTime,
+						},
+					},
+				},
+			},
+		}
+	}
+	table := []struct {
+		desc                      string
+		fakeNodeHandler           *testutil.FakeNodeHandler
+		updateReactor             func(action testcore.Action) (bool, runtime.Object, error)
+		fakeGetPodsAssignedToNode func(c *fake.Clientset) func(string) ([]*v1.Pod, error)
+		nodeIterations            []nodeIteration
+		expectedPodStatusUpdates  int
+	}{
+		// Node created long time ago, with status updated by kubelet exceeds grace period.
+		// First monitorNodeHealth check will update pod status to NotReady.
+		// Second monitorNodeHealth check will do no updates (no retry).
+		{
+			desc: "successful pod status update, no retry required",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			fakeGetPodsAssignedToNode: fakeGetPodsAssignedToNode,
+			nodeIterations: []nodeIteration{
+				{
+					timeToPass: 0,
+					newNodes:   makeNodes(v1.ConditionTrue, timeNow, timeNow),
+				},
+				{
+					timeToPass: 1 * time.Minute,
+					newNodes:   makeNodes(v1.ConditionTrue, timeNow, timeNow),
+				},
+				{
+					timeToPass: 1 * time.Minute,
+					newNodes:   makeNodes(v1.ConditionFalse, timePlusTwoMinutes, timePlusTwoMinutes),
+				},
+			},
+			expectedPodStatusUpdates: 1,
+		},
+		// Node created long time ago, with status updated by kubelet exceeds grace period.
+		// First monitorNodeHealth check will fail to update pod status to NotReady.
+		// Second monitorNodeHealth check will update pod status to NotReady (retry).
+		{
+			desc: "unsuccessful pod status update, retry required",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			updateReactor: func() func(action testcore.Action) (bool, runtime.Object, error) {
+				i := 0
+				return func(action testcore.Action) (bool, runtime.Object, error) {
+					if action.GetVerb() == "update" && action.GetResource().Resource == "pods" && action.GetSubresource() == "status" {
+						i++
+						switch i {
+						case 1:
+							return true, nil, fmt.Errorf("fake error")
+						default:
+							return true, testutil.NewPod("pod0", "node0"), nil
+						}
+					}
+
+					return true, nil, fmt.Errorf("unsupported action")
+				}
+			}(),
+			fakeGetPodsAssignedToNode: fakeGetPodsAssignedToNode,
+			nodeIterations: []nodeIteration{
+				{
+					timeToPass: 0,
+					newNodes:   makeNodes(v1.ConditionTrue, timeNow, timeNow),
+				},
+				{
+					timeToPass: 1 * time.Minute,
+					newNodes:   makeNodes(v1.ConditionTrue, timeNow, timeNow),
+				},
+				{
+					timeToPass: 1 * time.Minute,
+					newNodes:   makeNodes(v1.ConditionFalse, timePlusTwoMinutes, timePlusTwoMinutes),
+				},
+			},
+			expectedPodStatusUpdates: 2, // One failed and one retry.
+		},
+		// Node created long time ago, with status updated by kubelet exceeds grace period.
+		// First monitorNodeHealth check will fail to list pods.
+		// Second monitorNodeHealth check will update pod status to NotReady (retry).
+		{
+			desc: "unsuccessful pod list, retry required",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			fakeGetPodsAssignedToNode: func(c *fake.Clientset) func(string) ([]*v1.Pod, error) {
+				i := 0
+				f := fakeGetPodsAssignedToNode(c)
+				return func(nodeName string) ([]*v1.Pod, error) {
+					i++
+					if i == 1 {
+						return nil, fmt.Errorf("fake error")
+					}
+					return f(nodeName)
+				}
+			},
+			nodeIterations: []nodeIteration{
+				{
+					timeToPass: 0,
+					newNodes:   makeNodes(v1.ConditionTrue, timeNow, timeNow),
+				},
+				{
+					timeToPass: 1 * time.Minute,
+					newNodes:   makeNodes(v1.ConditionTrue, timeNow, timeNow),
+				},
+				{
+					timeToPass: 1 * time.Minute,
+					newNodes:   makeNodes(v1.ConditionFalse, timePlusTwoMinutes, timePlusTwoMinutes),
+				},
+			},
+			expectedPodStatusUpdates: 1,
+		},
+	}
+
+	for _, item := range table {
+		t.Run(item.desc, func(t *testing.T) {
+			nodeController, _ := newNodeLifecycleControllerFromClient(
+				item.fakeNodeHandler,
+				5*time.Minute,
+				testRateLimiterQPS,
+				testRateLimiterQPS,
+				testLargeClusterThreshold,
+				testUnhealthyThreshold,
+				testNodeMonitorGracePeriod,
+				testNodeStartupGracePeriod,
+				testNodeMonitorPeriod,
+				false)
+			if item.updateReactor != nil {
+				item.fakeNodeHandler.Clientset.PrependReactor("update", "pods", item.updateReactor)
+			}
+			nodeController.now = func() metav1.Time { return timeNow }
+			nodeController.recorder = testutil.NewFakeRecorder()
+			nodeController.getPodsAssignedToNode = item.fakeGetPodsAssignedToNode(item.fakeNodeHandler.Clientset)
+			for _, itertion := range item.nodeIterations {
+				nodeController.now = func() metav1.Time { return metav1.Time{Time: timeNow.Add(itertion.timeToPass)} }
+				item.fakeNodeHandler.Existing = itertion.newNodes
+				if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if err := nodeController.monitorNodeHealth(); err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+
+			podStatusUpdates := 0
+			for _, action := range item.fakeNodeHandler.Actions() {
+				if action.GetVerb() == "update" && action.GetResource().Resource == "pods" && action.GetSubresource() == "status" {
+					podStatusUpdates++
+				}
+			}
+			if podStatusUpdates != item.expectedPodStatusUpdates {
+				t.Errorf("expect pod status updated to happen %d times, but got %d", item.expectedPodStatusUpdates, podStatusUpdates)
+			}
+		})
+	}
+}
+
+// TestApplyNoExecuteTaints, ensures we just have a NoExecute taint applied to node.
+// NodeController is just responsible for enqueuing the node to tainting queue from which taint manager picks up
+// and evicts the pods on the node.
+func TestApplyNoExecuteTaints(t *testing.T) {
+	fakeNow := metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC)
+	evictionTimeout := 10 * time.Minute
+
+	fakeNodeHandler := &testutil.FakeNodeHandler{
+		Existing: []*v1.Node{
+			// Unreachable Taint with effect 'NoExecute' should be applied to this node.
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionUnknown,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			// Because of the logic that prevents NC from evicting anything when all Nodes are NotReady
+			// we need second healthy node in tests.
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node1",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			// NotReady Taint with NoExecute effect should be applied to this node.
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node2",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+		},
+		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+	}
+	healthyNodeNewStatus := v1.NodeStatus{
+		Conditions: []v1.NodeCondition{
+			{
+				Type:               v1.NodeReady,
+				Status:             v1.ConditionTrue,
+				LastHeartbeatTime:  metav1.Date(2017, 1, 1, 12, 10, 0, 0, time.UTC),
+				LastTransitionTime: metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC),
+			},
+		},
+	}
+	originalTaint := UnreachableTaintTemplate
+	nodeController, _ := newNodeLifecycleControllerFromClient(
+		fakeNodeHandler,
+		evictionTimeout,
+		testRateLimiterQPS,
+		testRateLimiterQPS,
+		testLargeClusterThreshold,
+		testUnhealthyThreshold,
+		testNodeMonitorGracePeriod,
+		testNodeStartupGracePeriod,
+		testNodeMonitorPeriod,
+		true)
+	nodeController.now = func() metav1.Time { return fakeNow }
+	nodeController.recorder = testutil.NewFakeRecorder()
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodeController.doNoExecuteTaintingPass()
+	node0, err := fakeNodeHandler.Get("node0", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node0...")
+		return
+	}
+	if !taintutils.TaintExists(node0.Spec.Taints, UnreachableTaintTemplate) {
+		t.Errorf("Can't find taint %v in %v", originalTaint, node0.Spec.Taints)
+	}
+	node2, err := fakeNodeHandler.Get("node2", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node2...")
+		return
+	}
+	if !taintutils.TaintExists(node2.Spec.Taints, NotReadyTaintTemplate) {
+		t.Errorf("Can't find taint %v in %v", NotReadyTaintTemplate, node2.Spec.Taints)
+	}
+
+	// Make node3 healthy again.
+	node2.Status = healthyNodeNewStatus
+	_, err = fakeNodeHandler.UpdateStatus(node2)
+	if err != nil {
+		t.Errorf(err.Error())
+		return
+	}
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodeController.doNoExecuteTaintingPass()
+
+	node2, err = fakeNodeHandler.Get("node2", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node2...")
+		return
+	}
+	// We should not see any taint on the node(especially the Not-Ready taint with NoExecute effect).
+	if taintutils.TaintExists(node2.Spec.Taints, NotReadyTaintTemplate) || len(node2.Spec.Taints) > 0 {
+		t.Errorf("Found taint %v in %v, which should not be present", NotReadyTaintTemplate, node2.Spec.Taints)
+	}
+}
+
 func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 	fakeNow := metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC)
 	evictionTimeout := 10 * time.Minute
@@ -1871,8 +2793,10 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
 					},
 				},
 				Status: v1.NodeStatus{
@@ -1894,8 +2818,10 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 					Name:              "node1",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
 					},
 				},
 				Status: v1.NodeStatus{
@@ -1938,7 +2864,6 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 	updatedTaint := NotReadyTaintTemplate
 
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		nil,
 		fakeNodeHandler,
 		evictionTimeout,
 		testRateLimiterQPS,
@@ -1951,10 +2876,11 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 		true)
 	nodeController.now = func() metav1.Time { return fakeNow }
 	nodeController.recorder = testutil.NewFakeRecorder()
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeStatus(); err != nil {
+	if err := nodeController.monitorNodeHealth(); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 	nodeController.doNoExecuteTaintingPass()
@@ -1992,7 +2918,7 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeStatus(); err != nil {
+	if err := nodeController.monitorNodeHealth(); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 	nodeController.doNoExecuteTaintingPass()
@@ -2020,8 +2946,10 @@ func TestTaintsNodeByCondition(t *testing.T) {
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
 					},
 				},
 				Status: v1.NodeStatus{
@@ -2040,7 +2968,6 @@ func TestTaintsNodeByCondition(t *testing.T) {
 	}
 
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		nil,
 		fakeNodeHandler,
 		evictionTimeout,
 		testRateLimiterQPS,
@@ -2053,13 +2980,18 @@ func TestTaintsNodeByCondition(t *testing.T) {
 		true)
 	nodeController.now = func() metav1.Time { return fakeNow }
 	nodeController.recorder = testutil.NewFakeRecorder()
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
 
-	outOfDiskTaint := &v1.Taint{
-		Key:    algorithm.TaintNodeOutOfDisk,
+	networkUnavailableTaint := &v1.Taint{
+		Key:    v1.TaintNodeNetworkUnavailable,
 		Effect: v1.TaintEffectNoSchedule,
 	}
-	networkUnavailableTaint := &v1.Taint{
-		Key:    algorithm.TaintNodeNetworkUnavailable,
+	notReadyTaint := &v1.Taint{
+		Key:    v1.TaintNodeNotReady,
+		Effect: v1.TaintEffectNoSchedule,
+	}
+	unreachableTaint := &v1.Taint{
+		Key:    v1.TaintNodeUnreachable,
 		Effect: v1.TaintEffectNoSchedule,
 	}
 
@@ -2075,8 +3007,10 @@ func TestTaintsNodeByCondition(t *testing.T) {
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
 					},
 				},
 				Status: v1.NodeStatus{
@@ -2099,14 +3033,16 @@ func TestTaintsNodeByCondition(t *testing.T) {
 			ExpectedTaints: []*v1.Taint{networkUnavailableTaint},
 		},
 		{
-			Name: "NetworkUnavailable and OutOfDisk are true",
+			Name: "NetworkUnavailable is true",
 			Node: &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
 					},
 				},
 				Status: v1.NodeStatus{
@@ -2119,12 +3055,6 @@ func TestTaintsNodeByCondition(t *testing.T) {
 						},
 						{
 							Type:               v1.NodeNetworkUnavailable,
-							Status:             v1.ConditionTrue,
-							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-						},
-						{
-							Type:               v1.NodeOutOfDisk,
 							Status:             v1.ConditionTrue,
 							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
 							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
@@ -2132,35 +3062,51 @@ func TestTaintsNodeByCondition(t *testing.T) {
 					},
 				},
 			},
-			ExpectedTaints: []*v1.Taint{networkUnavailableTaint, outOfDiskTaint},
+			ExpectedTaints: []*v1.Taint{networkUnavailableTaint},
 		},
 		{
-			Name: "NetworkUnavailable is true, OutOfDisk is unknown",
+			Name: "Ready is false",
 			Node: &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
 					},
 				},
 				Status: v1.NodeStatus{
 					Conditions: []v1.NodeCondition{
 						{
 							Type:               v1.NodeReady,
-							Status:             v1.ConditionTrue,
+							Status:             v1.ConditionFalse,
 							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
 							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
 						},
+					},
+				},
+			},
+			ExpectedTaints: []*v1.Taint{notReadyTaint},
+		},
+		{
+			Name: "Ready is unknown",
+			Node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
 						{
-							Type:               v1.NodeNetworkUnavailable,
-							Status:             v1.ConditionTrue,
-							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
-						},
-						{
-							Type:               v1.NodeOutOfDisk,
+							Type:               v1.NodeReady,
 							Status:             v1.ConditionUnknown,
 							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
 							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
@@ -2168,7 +3114,7 @@ func TestTaintsNodeByCondition(t *testing.T) {
 					},
 				},
 			},
-			ExpectedTaints: []*v1.Taint{networkUnavailableTaint},
+			ExpectedTaints: []*v1.Taint{unreachableTaint},
 		},
 	}
 
@@ -2177,7 +3123,7 @@ func TestTaintsNodeByCondition(t *testing.T) {
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		nodeController.doNoScheduleTaintingPass(test.Node)
+		nodeController.doNoScheduleTaintingPass(test.Node.Name)
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -2208,9 +3154,6 @@ func TestNodeEventGeneration(t *testing.T) {
 					UID:               "1234567890",
 					CreationTimestamp: metav1.Date(2015, 8, 10, 0, 0, 0, 0, time.UTC),
 				},
-				Spec: v1.NodeSpec{
-					ExternalID: "node0",
-				},
 				Status: v1.NodeStatus{
 					Conditions: []v1.NodeCondition{
 						{
@@ -2227,7 +3170,6 @@ func TestNodeEventGeneration(t *testing.T) {
 	}
 
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		nil,
 		fakeNodeHandler,
 		5*time.Minute,
 		testRateLimiterQPS,
@@ -2238,23 +3180,21 @@ func TestNodeEventGeneration(t *testing.T) {
 		testNodeStartupGracePeriod,
 		testNodeMonitorPeriod,
 		false)
-	nodeController.cloud = &fakecloud.FakeCloud{}
-	nodeController.nodeExistsInCloudProvider = func(nodeName types.NodeName) (bool, error) {
-		return false, nil
-	}
 	nodeController.now = func() metav1.Time { return fakeNow }
 	fakeRecorder := testutil.NewFakeRecorder()
 	nodeController.recorder = fakeRecorder
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
+
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeStatus(); err != nil {
+	if err := nodeController.monitorNodeHealth(); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if len(fakeRecorder.Events) != 2 {
-		t.Fatalf("unexpected events, got %v, expected %v: %+v", len(fakeRecorder.Events), 2, fakeRecorder.Events)
+	if len(fakeRecorder.Events) != 1 {
+		t.Fatalf("unexpected events, got %v, expected %v: %+v", len(fakeRecorder.Events), 1, fakeRecorder.Events)
 	}
-	if fakeRecorder.Events[0].Reason != "RegisteredNode" || fakeRecorder.Events[1].Reason != "DeletingNode" {
+	if fakeRecorder.Events[0].Reason != "RegisteredNode" {
 		var reasons []string
 		for _, event := range fakeRecorder.Events {
 			reasons = append(reasons, event.Reason)
@@ -2270,9 +3210,7 @@ func TestNodeEventGeneration(t *testing.T) {
 	}
 }
 
-// TestFixDeprecatedTaintKey verifies we have backwards compatibility after upgraded alpha taint key to GA taint key.
-// TODO(resouer): this is introduced in 1.9 and should be removed in the future.
-func TestFixDeprecatedTaintKey(t *testing.T) {
+func TestReconcileNodeLabels(t *testing.T) {
 	fakeNow := metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC)
 	evictionTimeout := 10 * time.Minute
 
@@ -2283,8 +3221,20 @@ func TestFixDeprecatedTaintKey(t *testing.T) {
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
+						v1.LabelZoneRegionStable:        "region1",
+						v1.LabelZoneFailureDomainStable: "zone1",
+						v1.LabelZoneRegion:              "region1",
+						v1.LabelZoneFailureDomain:       "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
 					},
 				},
 			},
@@ -2293,7 +3243,6 @@ func TestFixDeprecatedTaintKey(t *testing.T) {
 	}
 
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		nil,
 		fakeNodeHandler,
 		evictionTimeout,
 		testRateLimiterQPS,
@@ -2306,132 +3255,352 @@ func TestFixDeprecatedTaintKey(t *testing.T) {
 		true)
 	nodeController.now = func() metav1.Time { return fakeNow }
 	nodeController.recorder = testutil.NewFakeRecorder()
-
-	deprecatedNotReadyTaint := &v1.Taint{
-		Key:    algorithm.DeprecatedTaintNodeNotReady,
-		Effect: v1.TaintEffectNoExecute,
-	}
-
-	nodeNotReadyTaint := &v1.Taint{
-		Key:    algorithm.TaintNodeNotReady,
-		Effect: v1.TaintEffectNoExecute,
-	}
-
-	deprecatedUnreachableTaint := &v1.Taint{
-		Key:    algorithm.DeprecatedTaintNodeUnreachable,
-		Effect: v1.TaintEffectNoExecute,
-	}
-
-	nodeUnreachableTaint := &v1.Taint{
-		Key:    algorithm.TaintNodeUnreachable,
-		Effect: v1.TaintEffectNoExecute,
-	}
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
 
 	tests := []struct {
 		Name           string
 		Node           *v1.Node
-		ExpectedTaints []*v1.Taint
+		ExpectedLabels map[string]string
 	}{
 		{
-			Name: "Node with deprecated not-ready taint key",
+			Name: "No-op if node has no labels",
 			Node: &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
-					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
-					},
-				},
-				Spec: v1.NodeSpec{
-					Taints: []v1.Taint{
-						*deprecatedNotReadyTaint,
-					},
 				},
 			},
-			ExpectedTaints: []*v1.Taint{nodeNotReadyTaint},
+			ExpectedLabels: nil,
 		},
 		{
-			Name: "Node with deprecated unreachable taint key",
+			Name: "No-op if no target labels present",
 			Node: &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
-					},
-				},
-				Spec: v1.NodeSpec{
-					Taints: []v1.Taint{
-						*deprecatedUnreachableTaint,
+						v1.LabelZoneRegionStable: "region1",
 					},
 				},
 			},
-			ExpectedTaints: []*v1.Taint{nodeUnreachableTaint},
+			ExpectedLabels: map[string]string{
+				v1.LabelZoneRegionStable: "region1",
+			},
 		},
 		{
-			Name: "Node with not-ready taint key",
+			Name: "Create OS/arch stable labels when they don't exist",
 			Node: &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
-					},
-				},
-				Spec: v1.NodeSpec{
-					Taints: []v1.Taint{
-						*nodeNotReadyTaint,
+						kubeletapis.LabelOS:   "linux",
+						kubeletapis.LabelArch: "amd64",
 					},
 				},
 			},
-			ExpectedTaints: []*v1.Taint{nodeNotReadyTaint},
+			ExpectedLabels: map[string]string{
+				kubeletapis.LabelOS:   "linux",
+				kubeletapis.LabelArch: "amd64",
+				v1.LabelOSStable:      "linux",
+				v1.LabelArchStable:    "amd64",
+			},
 		},
 		{
-			Name: "Node with unreachable taint key",
+			Name: "Reconcile OS/arch stable labels to match beta labels",
 			Node: &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "node0",
 					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
 					Labels: map[string]string{
-						kubeletapis.LabelZoneRegion:        "region1",
-						kubeletapis.LabelZoneFailureDomain: "zone1",
-					},
-				},
-				Spec: v1.NodeSpec{
-					Taints: []v1.Taint{
-						*nodeUnreachableTaint,
+						kubeletapis.LabelOS:   "linux",
+						kubeletapis.LabelArch: "amd64",
+						v1.LabelOSStable:      "windows",
+						v1.LabelArchStable:    "arm",
 					},
 				},
 			},
-			ExpectedTaints: []*v1.Taint{nodeUnreachableTaint},
+			ExpectedLabels: map[string]string{
+				kubeletapis.LabelOS:   "linux",
+				kubeletapis.LabelArch: "amd64",
+				v1.LabelOSStable:      "linux",
+				v1.LabelArchStable:    "amd64",
+			},
 		},
 	}
 
 	for _, test := range tests {
 		fakeNodeHandler.Update(test.Node)
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
-			t.Errorf("unexpected error: %v", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
-		nodeController.doFixDeprecatedTaintKeyPass(test.Node)
+		nodeController.reconcileNodeLabels(test.Node.Name)
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
-			t.Errorf("unexpected error: %v", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
-		node, err := nodeController.nodeLister.Get(test.Node.GetName())
+		node0, err := nodeController.nodeLister.Get("node0")
 		if err != nil {
-			t.Errorf("Can't get current node...")
-			return
+			t.Fatalf("Can't get current node0...")
 		}
-		if len(node.Spec.Taints) != len(test.ExpectedTaints) {
+		if len(node0.Labels) != len(test.ExpectedLabels) {
 			t.Errorf("%s: Unexpected number of taints: expected %d, got %d",
-				test.Name, len(test.ExpectedTaints), len(node.Spec.Taints))
+				test.Name, len(test.ExpectedLabels), len(node0.Labels))
 		}
-		for _, taint := range test.ExpectedTaints {
-			if !taintutils.TaintExists(node.Spec.Taints, taint) {
-				t.Errorf("%s: Can't find taint %v in %v", test.Name, taint, node.Spec.Taints)
+		for key, expectedValue := range test.ExpectedLabels {
+			actualValue, ok := node0.Labels[key]
+			if !ok {
+				t.Errorf("%s: Can't find label %v in %v", test.Name, key, node0.Labels)
 			}
+			if actualValue != expectedValue {
+				t.Errorf("%s: label %q: expected value %q, got value %q", test.Name, key, expectedValue, actualValue)
+			}
+
 		}
+	}
+}
+
+func TestTryUpdateNodeHealth(t *testing.T) {
+	fakeNow := metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC)
+	fakeOld := metav1.Date(2016, 1, 1, 12, 0, 0, 0, time.UTC)
+	evictionTimeout := 10 * time.Minute
+
+	fakeNodeHandler := &testutil.FakeNodeHandler{
+		Existing: []*v1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeNow,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  fakeNow,
+							LastTransitionTime: fakeNow,
+						},
+					},
+				},
+			},
+		},
+		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+	}
+
+	nodeController, _ := newNodeLifecycleControllerFromClient(
+		fakeNodeHandler,
+		evictionTimeout,
+		testRateLimiterQPS,
+		testRateLimiterQPS,
+		testLargeClusterThreshold,
+		testUnhealthyThreshold,
+		testNodeMonitorGracePeriod,
+		testNodeStartupGracePeriod,
+		testNodeMonitorPeriod,
+		true)
+	nodeController.now = func() metav1.Time { return fakeNow }
+	nodeController.recorder = testutil.NewFakeRecorder()
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
+
+	getStatus := func(cond *v1.NodeCondition) *v1.ConditionStatus {
+		if cond == nil {
+			return nil
+		}
+		return &cond.Status
+	}
+
+	tests := []struct {
+		name string
+		node *v1.Node
+	}{
+		{
+			name: "Status true",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeNow,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  fakeNow,
+							LastTransitionTime: fakeNow,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Status false",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeNow,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  fakeNow,
+							LastTransitionTime: fakeNow,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Status unknown",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeNow,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionUnknown,
+							LastHeartbeatTime:  fakeNow,
+							LastTransitionTime: fakeNow,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Status nil",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeNow,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{},
+				},
+			},
+		},
+		{
+			name: "Status true - after grace period",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeOld,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  fakeOld,
+							LastTransitionTime: fakeOld,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Status false - after grace period",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeOld,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  fakeOld,
+							LastTransitionTime: fakeOld,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Status unknown - after grace period",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeOld,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionUnknown,
+							LastHeartbeatTime:  fakeOld,
+							LastTransitionTime: fakeOld,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Status nil - after grace period",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeOld,
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nodeController.nodeHealthMap.set(test.node.Name, &nodeHealthData{
+				status:                   &test.node.Status,
+				probeTimestamp:           test.node.CreationTimestamp,
+				readyTransitionTimestamp: test.node.CreationTimestamp,
+			})
+			_, _, currentReadyCondition, err := nodeController.tryUpdateNodeHealth(test.node)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			_, savedReadyCondition := nodeutil.GetNodeCondition(nodeController.nodeHealthMap.getDeepCopy(test.node.Name).status, v1.NodeReady)
+			savedStatus := getStatus(savedReadyCondition)
+			currentStatus := getStatus(currentReadyCondition)
+			if !apiequality.Semantic.DeepEqual(currentStatus, savedStatus) {
+				t.Errorf("expected %v, got %v", savedStatus, currentStatus)
+			}
+		})
+	}
+}
+
+func Test_isNodeExcludedFromDisruptionChecks(t *testing.T) {
+	validNodeStatus := v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: "Test"}}}
+	tests := []struct {
+		name string
+
+		enableExclusion bool
+		enableLegacy    bool
+		input           *v1.Node
+		want            bool
+	}{
+		{want: false, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}}},
+		{want: false, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Name: "master-abc"}}},
+		{want: false, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelNodeDisruptionExclusion: ""}}}},
+
+		{want: false, enableExclusion: true, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Name: "master-abc"}}},
+		{want: false, enableLegacy: true, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelNodeDisruptionExclusion: ""}}}},
+
+		{want: true, enableLegacy: true, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Name: "master-abc"}}},
+		{want: true, enableExclusion: true, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelNodeDisruptionExclusion: ""}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeDisruptionExclusion, tt.enableExclusion)()
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.LegacyNodeRoleBehavior, tt.enableLegacy)()
+
+			if result := isNodeExcludedFromDisruptionChecks(tt.input); result != tt.want {
+				t.Errorf("isNodeExcludedFromDisruptionChecks() = %v, want %v", result, tt.want)
+			}
+		})
 	}
 }

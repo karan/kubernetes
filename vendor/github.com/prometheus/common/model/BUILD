@@ -15,8 +15,9 @@ go_library(
         "time.go",
         "value.go",
     ],
+    importmap = "k8s.io/kubernetes/vendor/github.com/prometheus/common/model",
     importpath = "github.com/prometheus/common/model",
-    visibility = ["//visibility:public"],
+    visibility = ["//staging/src/k8s.io/component-base/metrics:prometheus_import_allow_list"],
 )
 
 filegroup(

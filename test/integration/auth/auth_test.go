@@ -22,6 +22,7 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -40,6 +41,7 @@ import (
 	"k8s.io/apiserver/pkg/authentication/group"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/apiserver/pkg/authentication/token/cache"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
@@ -84,11 +86,11 @@ func getTestWebhookTokenAuth(serverURL string) (authenticator.Request, error) {
 	if err := json.NewEncoder(kubecfgFile).Encode(config); err != nil {
 		return nil, err
 	}
-	webhookTokenAuth, err := webhook.New(kubecfgFile.Name(), 2*time.Minute)
+	webhookTokenAuth, err := webhook.New(kubecfgFile.Name(), "v1beta1", nil)
 	if err != nil {
 		return nil, err
 	}
-	return bearertoken.New(webhookTokenAuth), nil
+	return bearertoken.New(cache.New(webhookTokenAuth, false, 2*time.Minute, 2*time.Minute)), nil
 }
 
 func path(resource, namespace, name string) string {
@@ -108,7 +110,7 @@ func timeoutPath(resource, namespace, name string) string {
 }
 
 // Bodies for requests used in subsequent tests.
-var aPod string = `
+var aPod = `
 {
   "kind": "Pod",
   "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
@@ -126,7 +128,7 @@ var aPod string = `
   }
 }
 `
-var aRC string = `
+var aRC = `
 {
   "kind": "ReplicationController",
   "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
@@ -159,7 +161,7 @@ var aRC string = `
   }
 }
 `
-var aService string = `
+var aService = `
 {
   "kind": "Service",
   "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
@@ -183,7 +185,7 @@ var aService string = `
   }
 }
 `
-var aNode string = `
+var aNode = `
 {
   "kind": "Node",
   "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
@@ -214,7 +216,7 @@ func aEvent(namespace string) string {
 `
 }
 
-var aBinding string = `
+var aBinding = `
 {
   "kind": "Binding",
   "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
@@ -227,7 +229,7 @@ var aBinding string = `
 }
 `
 
-var emptyEndpoints string = `
+var emptyEndpoints = `
 {
   "kind": "Endpoints",
   "apiVersion": "v1",
@@ -237,7 +239,7 @@ var emptyEndpoints string = `
 }
 `
 
-var aEndpoints string = `
+var aEndpoints = `
 {
   "kind": "Endpoints",
   "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
@@ -262,7 +264,7 @@ var aEndpoints string = `
 }
 `
 
-var deleteNow string = `
+var deleteNow = `
 {
   "kind": "DeleteOptions",
   "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
@@ -397,7 +399,7 @@ func getTestRequests(namespace string) []struct {
 	return requests
 }
 
-// The TestAuthMode* tests tests a large number of URLs and checks that they
+// The TestAuthMode* tests a large number of URLs and checks that they
 // are FORBIDDEN or not, depending on the mode.  They do not attempt to do
 // detailed verification of behaviour beyond authorization.  They are not
 // fuzz tests.
@@ -492,10 +494,10 @@ func parseResourceVersion(response []byte) (string, float64, error) {
 }
 
 func getPreviousResourceVersionKey(url, id string) string {
-	baseUrl := strings.Split(url, "?")[0]
-	key := baseUrl
+	baseURL := strings.Split(url, "?")[0]
+	key := baseURL
 	if id != "" {
-		key = fmt.Sprintf("%s/%v", baseUrl, id)
+		key = fmt.Sprintf("%s/%v", baseURL, id)
 	}
 	return key
 }
@@ -538,7 +540,7 @@ func TestAuthModeAlwaysDeny(t *testing.T) {
 // TODO(etune): remove this test once a more comprehensive built-in authorizer is implemented.
 type allowAliceAuthorizer struct{}
 
-func (allowAliceAuthorizer) Authorize(a authorizer.Attributes) (authorizer.Decision, string, error) {
+func (allowAliceAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	if a.GetUser() != nil && a.GetUser().GetName() == "alice" {
 		return authorizer.DecisionAllow, "", nil
 	}
@@ -704,7 +706,7 @@ func TestUnknownUserIsUnauthorized(t *testing.T) {
 type impersonateAuthorizer struct{}
 
 // alice can't act as anyone and bob can't do anything but act-as someone
-func (impersonateAuthorizer) Authorize(a authorizer.Attributes) (authorizer.Decision, string, error) {
+func (impersonateAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	// alice can impersonate service accounts and do other actions
 	if a.GetUser() != nil && a.GetUser().GetName() == "alice" && a.GetVerb() == "impersonate" && a.GetResource() == "serviceaccounts" {
 		return authorizer.DecisionAllow, "", nil
@@ -863,7 +865,7 @@ type trackingAuthorizer struct {
 	requestAttributes []authorizer.Attributes
 }
 
-func (a *trackingAuthorizer) Authorize(attributes authorizer.Attributes) (authorizer.Decision, string, error) {
+func (a *trackingAuthorizer) Authorize(ctx context.Context, attributes authorizer.Attributes) (authorizer.Decision, string, error) {
 	a.requestAttributes = append(a.requestAttributes, attributes)
 	return authorizer.DecisionAllow, "", nil
 }
@@ -1074,8 +1076,8 @@ func TestKindAuthorization(t *testing.T) {
 			if r.verb == "PUT" && r.body != "" {
 				// For update operations, insert previous resource version
 				if resVersion := previousResourceVersion[getPreviousResourceVersionKey(r.URL, "")]; resVersion != 0 {
-					resourceVersionJson := fmt.Sprintf(",\r\n\"resourceVersion\": \"%v\"", resVersion)
-					bodyStr = fmt.Sprintf(r.body, resourceVersionJson)
+					resourceVersionJSON := fmt.Sprintf(",\r\n\"resourceVersion\": \"%v\"", resVersion)
+					bodyStr = fmt.Sprintf(r.body, resourceVersionJSON)
 				}
 			}
 		}

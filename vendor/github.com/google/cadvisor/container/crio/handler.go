@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/container/common"
@@ -29,47 +28,34 @@ import (
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
 
-	"github.com/opencontainers/runc/libcontainer/cgroups"
 	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
 	libcontainerconfigs "github.com/opencontainers/runc/libcontainer/configs"
 )
 
 type crioContainerHandler struct {
-	name               string
-	id                 string
-	aliases            []string
+	client crioClient
+	name   string
+
 	machineInfoFactory info.MachineInfoFactory
 
 	// Absolute path to the cgroup hierarchies of this container.
 	// (e.g.: "cpu" -> "/sys/fs/cgroup/cpu/test")
 	cgroupPaths map[string]string
 
-	// Manager of this container's cgroups.
-	cgroupManager cgroups.Manager
-
 	// the CRI-O storage driver
 	storageDriver    storageDriver
 	fsInfo           fs.FsInfo
 	rootfsStorageDir string
 
-	// Time at which this container was created.
-	creationTime time.Time
-
 	// Metadata associated with the container.
-	labels map[string]string
 	envs   map[string]string
+	labels map[string]string
 
 	// TODO
 	// crio version handling...
 
-	// The container PID used to switch namespaces as required
-	pid int
-
 	// Image name used for this container.
 	image string
-
-	// The host root FS to read
-	rootFs string
 
 	// The network mode of the container
 	// TODO
@@ -80,10 +66,14 @@ type crioContainerHandler struct {
 	// The IP address of the container
 	ipAddress string
 
-	ignoreMetrics container.MetricSet
+	includedMetrics container.MetricSet
 
-	// container restart count
-	restartCount int
+	reference info.ContainerReference
+
+	libcontainerHandler *containerlibcontainer.Handler
+	cgroupManager       *cgroupfs.Manager
+	rootFs              string
+	pidKnown            bool
 }
 
 var _ container.ContainerHandler = &crioContainerHandler{}
@@ -99,13 +89,10 @@ func newCrioContainerHandler(
 	cgroupSubsystems *containerlibcontainer.CgroupSubsystems,
 	inHostNamespace bool,
 	metadataEnvs []string,
-	ignoreMetrics container.MetricSet,
+	includedMetrics container.MetricSet,
 ) (container.ContainerHandler, error) {
 	// Create the cgroup paths.
-	cgroupPaths := make(map[string]string, len(cgroupSubsystems.MountPoints))
-	for key, val := range cgroupSubsystems.MountPoints {
-		cgroupPaths[key] = path.Join(val, name)
-	}
+	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems.MountPoints, name)
 
 	// Generate the equivalent cgroup manager for this container.
 	cgroupManager := &cgroupfs.Manager{
@@ -122,10 +109,19 @@ func newCrioContainerHandler(
 	}
 
 	id := ContainerNameToCrioId(name)
+	pidKnown := true
 
 	cInfo, err := client.ContainerInfo(id)
 	if err != nil {
 		return nil, err
+	}
+	if cInfo.Pid == 0 {
+		// If pid is not known yet, network related stats can not be retrieved by the
+		// libcontainer handler GetStats().  In this case, the crio handler GetStats()
+		// will reattempt to get the pid and, if now known, will construct the libcontainer
+		// handler.  This libcontainer handler is then cached and reused without additional
+		// calls to crio.
+		pidKnown = false
 	}
 
 	// passed to fs handler below ...
@@ -150,42 +146,54 @@ func newCrioContainerHandler(
 		rootfsStorageDir = filepath.Join(rootfsStorageDir, "diff")
 	}
 
-	// TODO: extract object mother method
-	handler := &crioContainerHandler{
-		id:                 id,
-		name:               name,
-		machineInfoFactory: machineInfoFactory,
-		cgroupPaths:        cgroupPaths,
-		cgroupManager:      cgroupManager,
-		storageDriver:      storageDriver,
-		fsInfo:             fsInfo,
-		rootFs:             rootFs,
-		rootfsStorageDir:   rootfsStorageDir,
-		envs:               make(map[string]string),
-		ignoreMetrics:      ignoreMetrics,
+	containerReference := info.ContainerReference{
+		Id:        id,
+		Name:      name,
+		Aliases:   []string{cInfo.Name, id},
+		Namespace: CrioNamespace,
 	}
 
-	handler.creationTime = time.Unix(0, cInfo.CreatedTime)
-	handler.pid = cInfo.Pid
-	handler.aliases = append(handler.aliases, cInfo.Name, id)
-	handler.labels = cInfo.Labels
+	libcontainerHandler := containerlibcontainer.NewHandler(cgroupManager, rootFs, cInfo.Pid, includedMetrics)
+
+	// TODO: extract object mother method
+	handler := &crioContainerHandler{
+		client:              client,
+		name:                name,
+		machineInfoFactory:  machineInfoFactory,
+		cgroupPaths:         cgroupPaths,
+		storageDriver:       storageDriver,
+		fsInfo:              fsInfo,
+		rootfsStorageDir:    rootfsStorageDir,
+		envs:                make(map[string]string),
+		labels:              cInfo.Labels,
+		includedMetrics:     includedMetrics,
+		reference:           containerReference,
+		libcontainerHandler: libcontainerHandler,
+		cgroupManager:       cgroupManager,
+		rootFs:              rootFs,
+		pidKnown:            pidKnown,
+	}
+
 	handler.image = cInfo.Image
 	// TODO: we wantd to know graph driver DeviceId (dont think this is needed now)
 
 	// ignore err and get zero as default, this happens with sandboxes, not sure why...
 	// kube isn't sending restart count in labels for sandboxes.
 	restartCount, _ := strconv.Atoi(cInfo.Annotations["io.kubernetes.container.restartCount"])
-	handler.restartCount = restartCount
+	// Only adds restartcount label if it's greater than 0
+	if restartCount > 0 {
+		handler.labels["restartcount"] = strconv.Itoa(restartCount)
+	}
 
 	handler.ipAddress = cInfo.IP
 
 	// we optionally collect disk usage metrics
-	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
+	if includedMetrics.Has(container.DiskUsageMetrics) {
 		handler.fsHandler = common.NewFsHandler(common.DefaultPeriod, rootfsStorageDir, storageLogDir, fsInfo)
 	}
 	// TODO for env vars we wanted to show from container.Config.Env from whitelist
 	//for _, exposedEnv := range metadataEnvs {
-	//glog.V(4).Infof("TODO env whitelist: %v", exposedEnv)
+	//klog.V(4).Infof("TODO env whitelist: %v", exposedEnv)
 	//}
 
 	return handler, nil
@@ -204,31 +212,21 @@ func (self *crioContainerHandler) Cleanup() {
 }
 
 func (self *crioContainerHandler) ContainerReference() (info.ContainerReference, error) {
-	return info.ContainerReference{
-		Id:        self.id,
-		Name:      self.name,
-		Aliases:   self.aliases,
-		Namespace: CrioNamespace,
-		Labels:    self.labels,
-	}, nil
+	return self.reference, nil
 }
 
 func (self *crioContainerHandler) needNet() bool {
-	if !self.ignoreMetrics.Has(container.NetworkUsageMetrics) {
+	if self.includedMetrics.Has(container.NetworkUsageMetrics) {
 		return self.labels["io.kubernetes.container.name"] == "POD"
 	}
 	return false
 }
 
 func (self *crioContainerHandler) GetSpec() (info.ContainerSpec, error) {
-	hasFilesystem := !self.ignoreMetrics.Has(container.DiskUsageMetrics)
+	hasFilesystem := self.includedMetrics.Has(container.DiskUsageMetrics)
 	spec, err := common.GetSpec(self.cgroupPaths, self.machineInfoFactory, self.needNet(), hasFilesystem)
 
 	spec.Labels = self.labels
-	// Only adds restartcount label if it's greater than 0
-	if self.restartCount > 0 {
-		spec.Labels["restartcount"] = strconv.Itoa(self.restartCount)
-	}
 	spec.Envs = self.envs
 	spec.Image = self.image
 
@@ -241,11 +239,11 @@ func (self *crioContainerHandler) getFsStats(stats *info.ContainerStats) error {
 		return err
 	}
 
-	if !self.ignoreMetrics.Has(container.DiskIOMetrics) {
+	if self.includedMetrics.Has(container.DiskIOMetrics) {
 		common.AssignDeviceNamesToDiskStats((*common.MachineInfoNamer)(mi), &stats.DiskIo)
 	}
 
-	if self.ignoreMetrics.Has(container.DiskUsageMetrics) {
+	if !self.includedMetrics.Has(container.DiskUsageMetrics) {
 		return nil
 	}
 	var device string
@@ -285,8 +283,27 @@ func (self *crioContainerHandler) getFsStats(stats *info.ContainerStats) error {
 	return nil
 }
 
+func (self *crioContainerHandler) getLibcontainerHandler() *containerlibcontainer.Handler {
+	if self.pidKnown {
+		return self.libcontainerHandler
+	}
+
+	id := ContainerNameToCrioId(self.name)
+
+	cInfo, err := self.client.ContainerInfo(id)
+	if err != nil || cInfo.Pid == 0 {
+		return self.libcontainerHandler
+	}
+
+	self.pidKnown = true
+	self.libcontainerHandler = containerlibcontainer.NewHandler(self.cgroupManager, self.rootFs, cInfo.Pid, self.includedMetrics)
+
+	return self.libcontainerHandler
+}
+
 func (self *crioContainerHandler) GetStats() (*info.ContainerStats, error) {
-	stats, err := containerlibcontainer.GetStats(self.cgroupManager, self.rootFs, self.pid, self.ignoreMetrics)
+	libcontainerHandler := self.getLibcontainerHandler()
+	stats, err := libcontainerHandler.GetStats()
 	if err != nil {
 		return stats, err
 	}
@@ -315,7 +332,7 @@ func (self *crioContainerHandler) ListContainers(listType container.ListType) ([
 func (self *crioContainerHandler) GetCgroupPath(resource string) (string, error) {
 	path, ok := self.cgroupPaths[resource]
 	if !ok {
-		return "", fmt.Errorf("could not find path for resource %q for container %q\n", resource, self.name)
+		return "", fmt.Errorf("could not find path for resource %q for container %q\n", resource, self.reference.Name)
 	}
 	return path, nil
 }
@@ -329,7 +346,7 @@ func (self *crioContainerHandler) GetContainerIPAddress() string {
 }
 
 func (self *crioContainerHandler) ListProcesses(listType container.ListType) ([]int, error) {
-	return containerlibcontainer.GetProcesses(self.cgroupManager)
+	return self.libcontainerHandler.GetProcesses()
 }
 
 func (self *crioContainerHandler) Exists() bool {

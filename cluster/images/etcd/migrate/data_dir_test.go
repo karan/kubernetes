@@ -39,7 +39,7 @@ func TestExistingDataDirWithVersionFile(t *testing.T) {
 		t.Fatalf("Failed to check if data dir is empty: %v", err)
 	}
 	if isEmpty {
-		t.Errorf("Data directory is non-empty")
+		t.Errorf("Expected non-empty data directory to exist")
 	}
 	exists, err := d.versionFile.Exists()
 	if err != nil {
@@ -97,7 +97,7 @@ func TestNonexistingDataDir(t *testing.T) {
 		t.Fatalf("Failed to check if data dir is empty: %v", err)
 	}
 	if !isEmpty {
-		t.Errorf("Data directory is empty")
+		t.Errorf("Expected empty data directory to exist")
 	}
 	err = d.Initialize(targetVersion)
 	if err != nil {
@@ -115,7 +115,7 @@ func TestNonexistingDataDir(t *testing.T) {
 		t.Fatalf("Failed to check if data dir is empty: %v", err)
 	}
 	if isEmpty {
-		t.Errorf("Data directory is non-empty")
+		t.Errorf("Expected non-empty data directory to exist after Initialize()")
 	}
 	vp, err := d.versionFile.Read()
 	if err != nil {
@@ -145,15 +145,18 @@ func TestBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if isEmpty {
-		t.Errorf("Expected non-empty backup directory afer Backup()")
+		t.Errorf("Expected non-empty backup directory to exist after Backup()")
 	}
 }
 
 func newTestPath(t *testing.T) string {
 	path, err := ioutil.TempDir("", "etcd-migrate-test-")
-	os.Chmod(path, 0777)
 	if err != nil {
 		t.Fatalf("Failed to create tmp dir for test: %v", err)
+	}
+	err = os.Chmod(path, 0777)
+	if err != nil {
+		t.Fatalf("Failed to granting permission to tmp dir for test: %v", err)
 	}
 	return path
 }

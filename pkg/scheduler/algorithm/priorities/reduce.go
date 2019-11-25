@@ -18,22 +18,21 @@ package priorities
 
 import (
 	"k8s.io/api/core/v1"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
-	"k8s.io/kubernetes/pkg/scheduler/schedulercache"
+	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	schedulerlisters "k8s.io/kubernetes/pkg/scheduler/listers"
 )
 
 // NormalizeReduce generates a PriorityReduceFunction that can normalize the result
 // scores to [0, maxPriority]. If reverse is set to true, it reverses the scores by
 // subtracting it from maxPriority.
-func NormalizeReduce(maxPriority int, reverse bool) algorithm.PriorityReduceFunction {
+func NormalizeReduce(maxPriority int64, reverse bool) PriorityReduceFunction {
 	return func(
 		_ *v1.Pod,
 		_ interface{},
-		_ map[string]*schedulercache.NodeInfo,
-		result schedulerapi.HostPriorityList) error {
+		_ schedulerlisters.SharedLister,
+		result framework.NodeScoreList) error {
 
-		var maxCount int
+		var maxCount int64
 		for i := range result {
 			if result[i].Score > maxCount {
 				maxCount = result[i].Score

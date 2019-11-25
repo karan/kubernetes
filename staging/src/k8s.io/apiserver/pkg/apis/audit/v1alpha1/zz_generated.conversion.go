@@ -23,8 +23,8 @@ package v1alpha1
 import (
 	unsafe "unsafe"
 
-	authentication_v1 "k8s.io/api/authentication/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	conversion "k8s.io/apimachinery/pkg/conversion"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	types "k8s.io/apimachinery/pkg/types"
@@ -37,23 +37,78 @@ func init() {
 
 // RegisterConversions adds conversion functions to the given scheme.
 // Public to allow building arbitrary schemes.
-func RegisterConversions(scheme *runtime.Scheme) error {
-	return scheme.AddGeneratedConversionFuncs(
-		Convert_v1alpha1_Event_To_audit_Event,
-		Convert_audit_Event_To_v1alpha1_Event,
-		Convert_v1alpha1_EventList_To_audit_EventList,
-		Convert_audit_EventList_To_v1alpha1_EventList,
-		Convert_v1alpha1_GroupResources_To_audit_GroupResources,
-		Convert_audit_GroupResources_To_v1alpha1_GroupResources,
-		Convert_v1alpha1_ObjectReference_To_audit_ObjectReference,
-		Convert_audit_ObjectReference_To_v1alpha1_ObjectReference,
-		Convert_v1alpha1_Policy_To_audit_Policy,
-		Convert_audit_Policy_To_v1alpha1_Policy,
-		Convert_v1alpha1_PolicyList_To_audit_PolicyList,
-		Convert_audit_PolicyList_To_v1alpha1_PolicyList,
-		Convert_v1alpha1_PolicyRule_To_audit_PolicyRule,
-		Convert_audit_PolicyRule_To_v1alpha1_PolicyRule,
-	)
+func RegisterConversions(s *runtime.Scheme) error {
+	if err := s.AddGeneratedConversionFunc((*EventList)(nil), (*audit.EventList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_EventList_To_audit_EventList(a.(*EventList), b.(*audit.EventList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*audit.EventList)(nil), (*EventList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_audit_EventList_To_v1alpha1_EventList(a.(*audit.EventList), b.(*EventList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*GroupResources)(nil), (*audit.GroupResources)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_GroupResources_To_audit_GroupResources(a.(*GroupResources), b.(*audit.GroupResources), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*audit.GroupResources)(nil), (*GroupResources)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_audit_GroupResources_To_v1alpha1_GroupResources(a.(*audit.GroupResources), b.(*GroupResources), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*Policy)(nil), (*audit.Policy)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_Policy_To_audit_Policy(a.(*Policy), b.(*audit.Policy), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*audit.Policy)(nil), (*Policy)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_audit_Policy_To_v1alpha1_Policy(a.(*audit.Policy), b.(*Policy), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*PolicyList)(nil), (*audit.PolicyList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_PolicyList_To_audit_PolicyList(a.(*PolicyList), b.(*audit.PolicyList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*audit.PolicyList)(nil), (*PolicyList)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_audit_PolicyList_To_v1alpha1_PolicyList(a.(*audit.PolicyList), b.(*PolicyList), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*PolicyRule)(nil), (*audit.PolicyRule)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_PolicyRule_To_audit_PolicyRule(a.(*PolicyRule), b.(*audit.PolicyRule), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*audit.PolicyRule)(nil), (*PolicyRule)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_audit_PolicyRule_To_v1alpha1_PolicyRule(a.(*audit.PolicyRule), b.(*PolicyRule), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*audit.Event)(nil), (*Event)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_audit_Event_To_v1alpha1_Event(a.(*audit.Event), b.(*Event), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*audit.ObjectReference)(nil), (*ObjectReference)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_audit_ObjectReference_To_v1alpha1_ObjectReference(a.(*audit.ObjectReference), b.(*ObjectReference), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*Event)(nil), (*audit.Event)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_Event_To_audit_Event(a.(*Event), b.(*audit.Event), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*ObjectReference)(nil), (*audit.ObjectReference)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1alpha1_ObjectReference_To_audit_ObjectReference(a.(*ObjectReference), b.(*audit.ObjectReference), scope)
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func autoConvert_v1alpha1_Event_To_audit_Event(in *Event, out *audit.Event, s conversion.Scope) error {
@@ -64,12 +119,10 @@ func autoConvert_v1alpha1_Event_To_audit_Event(in *Event, out *audit.Event, s co
 	out.Stage = audit.Stage(in.Stage)
 	out.RequestURI = in.RequestURI
 	out.Verb = in.Verb
-	// TODO: Inefficient conversion - can we improve it?
-	if err := s.Convert(&in.User, &out.User, 0); err != nil {
-		return err
-	}
-	out.ImpersonatedUser = (*audit.UserInfo)(unsafe.Pointer(in.ImpersonatedUser))
+	out.User = in.User
+	out.ImpersonatedUser = (*v1.UserInfo)(unsafe.Pointer(in.ImpersonatedUser))
 	out.SourceIPs = *(*[]string)(unsafe.Pointer(&in.SourceIPs))
+	out.UserAgent = in.UserAgent
 	if in.ObjectRef != nil {
 		in, out := &in.ObjectRef, &out.ObjectRef
 		*out = new(audit.ObjectReference)
@@ -79,7 +132,7 @@ func autoConvert_v1alpha1_Event_To_audit_Event(in *Event, out *audit.Event, s co
 	} else {
 		out.ObjectRef = nil
 	}
-	out.ResponseStatus = (*v1.Status)(unsafe.Pointer(in.ResponseStatus))
+	out.ResponseStatus = (*metav1.Status)(unsafe.Pointer(in.ResponseStatus))
 	out.RequestObject = (*runtime.Unknown)(unsafe.Pointer(in.RequestObject))
 	out.ResponseObject = (*runtime.Unknown)(unsafe.Pointer(in.ResponseObject))
 	out.RequestReceivedTimestamp = in.RequestReceivedTimestamp
@@ -94,12 +147,10 @@ func autoConvert_audit_Event_To_v1alpha1_Event(in *audit.Event, out *Event, s co
 	out.Stage = Stage(in.Stage)
 	out.RequestURI = in.RequestURI
 	out.Verb = in.Verb
-	// TODO: Inefficient conversion - can we improve it?
-	if err := s.Convert(&in.User, &out.User, 0); err != nil {
-		return err
-	}
-	out.ImpersonatedUser = (*authentication_v1.UserInfo)(unsafe.Pointer(in.ImpersonatedUser))
+	out.User = in.User
+	out.ImpersonatedUser = (*v1.UserInfo)(unsafe.Pointer(in.ImpersonatedUser))
 	out.SourceIPs = *(*[]string)(unsafe.Pointer(&in.SourceIPs))
+	out.UserAgent = in.UserAgent
 	if in.ObjectRef != nil {
 		in, out := &in.ObjectRef, &out.ObjectRef
 		*out = new(ObjectReference)
@@ -109,7 +160,7 @@ func autoConvert_audit_Event_To_v1alpha1_Event(in *audit.Event, out *Event, s co
 	} else {
 		out.ObjectRef = nil
 	}
-	out.ResponseStatus = (*v1.Status)(unsafe.Pointer(in.ResponseStatus))
+	out.ResponseStatus = (*metav1.Status)(unsafe.Pointer(in.ResponseStatus))
 	out.RequestObject = (*runtime.Unknown)(unsafe.Pointer(in.RequestObject))
 	out.ResponseObject = (*runtime.Unknown)(unsafe.Pointer(in.ResponseObject))
 	out.RequestReceivedTimestamp = in.RequestReceivedTimestamp

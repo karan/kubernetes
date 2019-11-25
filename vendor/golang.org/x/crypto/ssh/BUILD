@@ -20,10 +20,12 @@ go_library(
         "mux.go",
         "server.go",
         "session.go",
+        "ssh_gss.go",
         "streamlocal.go",
         "tcpip.go",
         "transport.go",
     ],
+    importmap = "k8s.io/kubernetes/vendor/golang.org/x/crypto/ssh",
     importpath = "golang.org/x/crypto/ssh",
     visibility = ["//visibility:public"],
     deps = [

@@ -27,14 +27,14 @@ import (
 	versionedinformers "k8s.io/client-go/informers"
 	"k8s.io/kubernetes/pkg/auth/authorizer/abac"
 	"k8s.io/kubernetes/pkg/auth/nodeidentifier"
-	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/node"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac/bootstrappolicy"
 )
 
-type AuthorizationConfig struct {
+// Config contains the data on how to authorize a request to the Kube API Server
+type Config struct {
 	AuthorizationModes []string
 
 	// Options for ModeABAC
@@ -46,18 +46,19 @@ type AuthorizationConfig struct {
 
 	// Kubeconfig file for Webhook authorization plugin.
 	WebhookConfigFile string
+	// API version of subject access reviews to send to the webhook (e.g. "v1", "v1beta1")
+	WebhookVersion string
 	// TTL for caching of authorized responses from the webhook server.
 	WebhookCacheAuthorizedTTL time.Duration
 	// TTL for caching of unauthorized responses from the webhook server.
 	WebhookCacheUnauthorizedTTL time.Duration
 
-	InformerFactory          informers.SharedInformerFactory
 	VersionedInformerFactory versionedinformers.SharedInformerFactory
 }
 
 // New returns the right sort of union of multiple authorizer.Authorizer objects
 // based on the authorizationMode or an error.
-func (config AuthorizationConfig) New() (authorizer.Authorizer, authorizer.RuleResolver, error) {
+func (config Config) New() (authorizer.Authorizer, authorizer.RuleResolver, error) {
 	if len(config.AuthorizationModes) == 0 {
 		return nil, nil, fmt.Errorf("at least one authorization mode must be passed")
 	}
@@ -74,10 +75,10 @@ func (config AuthorizationConfig) New() (authorizer.Authorizer, authorizer.RuleR
 			graph := node.NewGraph()
 			node.AddGraphEventHandlers(
 				graph,
-				config.InformerFactory.Core().InternalVersion().Nodes(),
-				config.InformerFactory.Core().InternalVersion().Pods(),
-				config.InformerFactory.Core().InternalVersion().PersistentVolumes(),
-				config.VersionedInformerFactory.Storage().V1beta1().VolumeAttachments(),
+				config.VersionedInformerFactory.Core().V1().Nodes(),
+				config.VersionedInformerFactory.Core().V1().Pods(),
+				config.VersionedInformerFactory.Core().V1().PersistentVolumes(),
+				config.VersionedInformerFactory.Storage().V1().VolumeAttachments(),
 			)
 			nodeAuthorizer := node.NewAuthorizer(graph, nodeidentifier.NewDefaultNodeIdentifier(), bootstrappolicy.NodeRules())
 			authorizers = append(authorizers, nodeAuthorizer)
@@ -99,6 +100,7 @@ func (config AuthorizationConfig) New() (authorizer.Authorizer, authorizer.RuleR
 			ruleResolvers = append(ruleResolvers, abacAuthorizer)
 		case modes.ModeWebhook:
 			webhookAuthorizer, err := webhook.New(config.WebhookConfigFile,
+				config.WebhookVersion,
 				config.WebhookCacheAuthorizedTTL,
 				config.WebhookCacheUnauthorizedTTL)
 			if err != nil {
@@ -108,10 +110,10 @@ func (config AuthorizationConfig) New() (authorizer.Authorizer, authorizer.RuleR
 			ruleResolvers = append(ruleResolvers, webhookAuthorizer)
 		case modes.ModeRBAC:
 			rbacAuthorizer := rbac.New(
-				&rbac.RoleGetter{Lister: config.InformerFactory.Rbac().InternalVersion().Roles().Lister()},
-				&rbac.RoleBindingLister{Lister: config.InformerFactory.Rbac().InternalVersion().RoleBindings().Lister()},
-				&rbac.ClusterRoleGetter{Lister: config.InformerFactory.Rbac().InternalVersion().ClusterRoles().Lister()},
-				&rbac.ClusterRoleBindingLister{Lister: config.InformerFactory.Rbac().InternalVersion().ClusterRoleBindings().Lister()},
+				&rbac.RoleGetter{Lister: config.VersionedInformerFactory.Rbac().V1().Roles().Lister()},
+				&rbac.RoleBindingLister{Lister: config.VersionedInformerFactory.Rbac().V1().RoleBindings().Lister()},
+				&rbac.ClusterRoleGetter{Lister: config.VersionedInformerFactory.Rbac().V1().ClusterRoles().Lister()},
+				&rbac.ClusterRoleBindingLister{Lister: config.VersionedInformerFactory.Rbac().V1().ClusterRoleBindings().Lister()},
 			)
 			authorizers = append(authorizers, rbacAuthorizer)
 			ruleResolvers = append(ruleResolvers, rbacAuthorizer)

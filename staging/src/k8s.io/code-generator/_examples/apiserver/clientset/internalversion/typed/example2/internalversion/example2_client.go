@@ -33,8 +33,8 @@ type SecondExampleClient struct {
 	restClient rest.Interface
 }
 
-func (c *SecondExampleClient) TestTypes(namespace string) TestTypeInterface {
-	return newTestTypes(c, namespace)
+func (c *SecondExampleClient) TestTypes() TestTypeInterface {
+	return newTestTypes(c)
 }
 
 // NewForConfig creates a new SecondExampleClient for the given config.
@@ -66,17 +66,12 @@ func New(c rest.Interface) *SecondExampleClient {
 }
 
 func setConfigDefaults(config *rest.Config) error {
-	g, err := scheme.Registry.Group("example.test.apiserver.code-generator.k8s.io")
-	if err != nil {
-		return err
-	}
-
 	config.APIPath = "/apis"
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-	if config.GroupVersion == nil || config.GroupVersion.Group != g.GroupVersion.Group {
-		gv := g.GroupVersion
+	if config.GroupVersion == nil || config.GroupVersion.Group != scheme.Scheme.PrioritizedVersionsForGroup("example.test.apiserver.code-generator.k8s.io")[0].Group {
+		gv := scheme.Scheme.PrioritizedVersionsForGroup("example.test.apiserver.code-generator.k8s.io")[0]
 		config.GroupVersion = &gv
 	}
 	config.NegotiatedSerializer = scheme.Codecs

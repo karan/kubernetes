@@ -17,18 +17,12 @@ limitations under the License.
 package leaderelectionconfig
 
 import (
-	"time"
-
 	"github.com/spf13/pflag"
-	"k8s.io/kubernetes/pkg/apis/componentconfig"
+	componentbaseconfig "k8s.io/component-base/config"
 )
 
-const (
-	DefaultLeaseDuration = 15 * time.Second
-)
-
-// BindFlags binds the common LeaderElectionCLIConfig flags to a flagset
-func BindFlags(l *componentconfig.LeaderElectionConfiguration, fs *pflag.FlagSet) {
+// BindFlags binds the LeaderElectionConfiguration struct fields to a flagset
+func BindFlags(l *componentbaseconfig.LeaderElectionConfiguration, fs *pflag.FlagSet) {
 	fs.BoolVar(&l.LeaderElect, "leader-elect", l.LeaderElect, ""+
 		"Start a leader election client and gain leadership before "+
 		"executing the main loop. Enable this when running replicated "+
@@ -49,4 +43,10 @@ func BindFlags(l *componentconfig.LeaderElectionConfiguration, fs *pflag.FlagSet
 	fs.StringVar(&l.ResourceLock, "leader-elect-resource-lock", l.ResourceLock, ""+
 		"The type of resource object that is used for locking during "+
 		"leader election. Supported options are `endpoints` (default) and `configmaps`.")
+	fs.StringVar(&l.ResourceName, "leader-elect-resource-name", l.ResourceName, ""+
+		"The name of resource object that is used for locking during "+
+		"leader election.")
+	fs.StringVar(&l.ResourceNamespace, "leader-elect-resource-namespace", l.ResourceNamespace, ""+
+		"The namespace of resource object that is used for locking during "+
+		"leader election.")
 }

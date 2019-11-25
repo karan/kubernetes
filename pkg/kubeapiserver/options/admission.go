@@ -22,13 +22,13 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/rest"
+	"k8s.io/component-base/featuregate"
 )
 
 // AdmissionOptions holds the admission options.
@@ -73,6 +73,7 @@ func (a *AdmissionOptions) AddFlags(fs *pflag.FlagSet) {
 		"The order of plugins in which they are passed to this flag does not matter. "+
 		"Comma-delimited list of: "+strings.Join(a.GenericAdmission.Plugins.Registered(), ", ")+".")
 	fs.MarkDeprecated("admission-control", "Use --enable-admission-plugins or --disable-admission-plugins instead. Will be removed in a future version.")
+	fs.Lookup("admission-control").Hidden = false
 
 	a.GenericAdmission.AddFlags(fs)
 }
@@ -107,7 +108,7 @@ func (a *AdmissionOptions) ApplyTo(
 	c *server.Config,
 	informers informers.SharedInformerFactory,
 	kubeAPIServerClientConfig *rest.Config,
-	scheme *runtime.Scheme,
+	features featuregate.FeatureGate,
 	pluginInitializers ...admission.PluginInitializer,
 ) error {
 	if a == nil {
@@ -119,7 +120,7 @@ func (a *AdmissionOptions) ApplyTo(
 		a.GenericAdmission.EnablePlugins, a.GenericAdmission.DisablePlugins = computePluginNames(a.PluginNames, a.GenericAdmission.RecommendedPluginOrder)
 	}
 
-	return a.GenericAdmission.ApplyTo(c, informers, kubeAPIServerClientConfig, scheme, pluginInitializers...)
+	return a.GenericAdmission.ApplyTo(c, informers, kubeAPIServerClientConfig, features, pluginInitializers...)
 }
 
 // explicitly disable all plugins that are not in the enabled list

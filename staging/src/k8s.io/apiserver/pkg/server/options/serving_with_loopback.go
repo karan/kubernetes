@@ -17,12 +17,13 @@ limitations under the License.
 package options
 
 import (
-	"crypto/tls"
 	"fmt"
 
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
 
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	"k8s.io/client-go/rest"
 	certutil "k8s.io/client-go/util/cert"
 )
 
@@ -30,25 +31,23 @@ type SecureServingOptionsWithLoopback struct {
 	*SecureServingOptions
 }
 
-func WithLoopback(o *SecureServingOptions) *SecureServingOptionsWithLoopback {
+func (o *SecureServingOptions) WithLoopback() *SecureServingOptionsWithLoopback {
 	return &SecureServingOptionsWithLoopback{o}
 }
 
 // ApplyTo fills up serving information in the server configuration.
-func (s *SecureServingOptionsWithLoopback) ApplyTo(c *server.Config) error {
-	if s == nil || s.SecureServingOptions == nil {
+func (s *SecureServingOptionsWithLoopback) ApplyTo(secureServingInfo **server.SecureServingInfo, loopbackClientConfig **rest.Config) error {
+	if s == nil || s.SecureServingOptions == nil || secureServingInfo == nil {
 		return nil
 	}
 
-	if err := s.SecureServingOptions.ApplyTo(&c.SecureServing); err != nil {
+	if err := s.SecureServingOptions.ApplyTo(secureServingInfo); err != nil {
 		return err
 	}
 
-	if c.SecureServing == nil {
+	if *secureServingInfo == nil || loopbackClientConfig == nil {
 		return nil
 	}
-
-	c.ReadWritePort = s.BindPort
 
 	// create self-signed cert+key with the fake server.LoopbackClientServerNameOverride and
 	// let the server return it when the loopback client connects.
@@ -56,23 +55,24 @@ func (s *SecureServingOptionsWithLoopback) ApplyTo(c *server.Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to generate self-signed certificate for loopback connection: %v", err)
 	}
-	tlsCert, err := tls.X509KeyPair(certPem, keyPem)
+	certProvider, err := dynamiccertificates.NewStaticSNICertKeyContent("self-signed loopback", certPem, keyPem, server.LoopbackClientServerNameOverride)
 	if err != nil {
 		return fmt.Errorf("failed to generate self-signed certificate for loopback connection: %v", err)
 	}
 
-	secureLoopbackClientConfig, err := c.SecureServing.NewLoopbackClientConfig(uuid.NewRandom().String(), certPem)
+	secureLoopbackClientConfig, err := (*secureServingInfo).NewLoopbackClientConfig(uuid.New().String(), certPem)
 	switch {
 	// if we failed and there's no fallback loopback client config, we need to fail
-	case err != nil && c.LoopbackClientConfig == nil:
+	case err != nil && *loopbackClientConfig == nil:
 		return err
 
 	// if we failed, but we already have a fallback loopback client config (usually insecure), allow it
-	case err != nil && c.LoopbackClientConfig != nil:
+	case err != nil && *loopbackClientConfig != nil:
 
 	default:
-		c.LoopbackClientConfig = secureLoopbackClientConfig
-		c.SecureServing.SNICerts[server.LoopbackClientServerNameOverride] = &tlsCert
+		*loopbackClientConfig = secureLoopbackClientConfig
+		// Write to the front of SNICerts so that this overrides any other certs with the same name
+		(*secureServingInfo).SNICerts = append([]dynamiccertificates.SNICertKeyContentProvider{certProvider}, (*secureServingInfo).SNICerts...)
 	}
 
 	return nil

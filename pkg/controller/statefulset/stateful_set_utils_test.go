@@ -19,6 +19,7 @@ package statefulset
 import (
 	"fmt"
 	"math/rand"
+	"reflect"
 	"sort"
 	"strconv"
 	"testing"
@@ -56,7 +57,7 @@ func TestIsMemberOf(t *testing.T) {
 	set2.Name = "foo2"
 	pod := newStatefulSetPod(set, 1)
 	if !isMemberOf(set, pod) {
-		t.Error("isMemberOf retruned false negative")
+		t.Error("isMemberOf returned false negative")
 	}
 	if isMemberOf(set2, pod) {
 		t.Error("isMemberOf returned false positive")
@@ -89,7 +90,7 @@ func TestStorageMatches(t *testing.T) {
 	set := newStatefulSet(3)
 	pod := newStatefulSetPod(set, 1)
 	if !storageMatches(set, pod) {
-		t.Error("Newly created Pod has a invalid stroage")
+		t.Error("Newly created Pod has a invalid storage")
 	}
 	pod.Spec.Volumes = nil
 	if storageMatches(set, pod) {
@@ -143,7 +144,7 @@ func TestUpdateStorage(t *testing.T) {
 	set := newStatefulSet(3)
 	pod := newStatefulSetPod(set, 1)
 	if !storageMatches(set, pod) {
-		t.Error("Newly created Pod has a invalid stroage")
+		t.Error("Newly created Pod has a invalid storage")
 	}
 	pod.Spec.Volumes = nil
 	if storageMatches(set, pod) {
@@ -285,6 +286,101 @@ func TestCreateApplyRevision(t *testing.T) {
 	}
 	if value != expectedValue {
 		t.Errorf("for annotation %s wanted %s got %s", key, expectedValue, value)
+	}
+}
+
+func TestRollingUpdateApplyRevision(t *testing.T) {
+	set := newStatefulSet(1)
+	set.Status.CollisionCount = new(int32)
+	currentSet := set.DeepCopy()
+	currentRevision, err := newRevision(set, 1, set.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	set.Spec.Template.Spec.Containers[0].Env = []v1.EnvVar{{Name: "foo", Value: "bar"}}
+	updateSet := set.DeepCopy()
+	updateRevision, err := newRevision(set, 2, set.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restoredCurrentSet, err := ApplyRevision(set, currentRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(currentSet.Spec.Template, restoredCurrentSet.Spec.Template) {
+		t.Errorf("want %v got %v", currentSet.Spec.Template, restoredCurrentSet.Spec.Template)
+	}
+
+	restoredUpdateSet, err := ApplyRevision(set, updateRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(updateSet.Spec.Template, restoredUpdateSet.Spec.Template) {
+		t.Errorf("want %v got %v", updateSet.Spec.Template, restoredUpdateSet.Spec.Template)
+	}
+}
+
+func TestGetPersistentVolumeClaims(t *testing.T) {
+
+	// nil inherits statefulset labels
+	pod := newPod()
+	statefulSet := newStatefulSet(1)
+	statefulSet.Spec.Selector.MatchLabels = nil
+	claims := getPersistentVolumeClaims(statefulSet, pod)
+	pvc := newPVC("datadir-foo-0")
+	pvc.SetNamespace(v1.NamespaceDefault)
+	resultClaims := map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+
+	// nil inherits statefulset labels
+	statefulSet.Spec.Selector.MatchLabels = map[string]string{"test": "test"}
+	claims = getPersistentVolumeClaims(statefulSet, pod)
+	pvc.SetLabels(map[string]string{"test": "test"})
+	resultClaims = map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+
+	// non-nil with non-overlapping labels merge pvc and statefulset labels
+	statefulSet.Spec.Selector.MatchLabels = map[string]string{"name": "foo"}
+	statefulSet.Spec.VolumeClaimTemplates[0].ObjectMeta.Labels = map[string]string{"test": "test"}
+	claims = getPersistentVolumeClaims(statefulSet, pod)
+	pvc.SetLabels(map[string]string{"test": "test", "name": "foo"})
+	resultClaims = map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+
+	// non-nil with overlapping labels merge pvc and statefulset labels and prefer statefulset labels
+	statefulSet.Spec.Selector.MatchLabels = map[string]string{"test": "foo"}
+	statefulSet.Spec.VolumeClaimTemplates[0].ObjectMeta.Labels = map[string]string{"test": "test"}
+	claims = getPersistentVolumeClaims(statefulSet, pod)
+	pvc.SetLabels(map[string]string{"test": "foo"})
+	resultClaims = map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+}
+
+func newPod() *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo-0",
+			Namespace: v1.NamespaceDefault,
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:  "nginx",
+					Image: "nginx",
+				},
+			},
+		},
 	}
 }
 

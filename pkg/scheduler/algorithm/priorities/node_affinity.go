@@ -19,30 +19,29 @@ package priorities
 import (
 	"fmt"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
-	"k8s.io/kubernetes/pkg/scheduler/schedulercache"
+	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
 )
 
 // CalculateNodeAffinityPriorityMap prioritizes nodes according to node affinity scheduling preferences
-// indicated in PreferredDuringSchedulingIgnoredDuringExecution. Each time a node match a preferredSchedulingTerm,
-// it will a get an add of preferredSchedulingTerm.Weight. Thus, the more preferredSchedulingTerms
+// indicated in PreferredDuringSchedulingIgnoredDuringExecution. Each time a node matches a preferredSchedulingTerm,
+// it will get an add of preferredSchedulingTerm.Weight. Thus, the more preferredSchedulingTerms
 // the node satisfies and the more the preferredSchedulingTerm that is satisfied weights, the higher
 // score the node gets.
-func CalculateNodeAffinityPriorityMap(pod *v1.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+func CalculateNodeAffinityPriorityMap(pod *v1.Pod, meta interface{}, nodeInfo *schedulernodeinfo.NodeInfo) (framework.NodeScore, error) {
 	node := nodeInfo.Node()
 	if node == nil {
-		return schedulerapi.HostPriority{}, fmt.Errorf("node not found")
+		return framework.NodeScore{}, fmt.Errorf("node not found")
 	}
 
-	var affinity *v1.Affinity
+	// default is the podspec.
+	affinity := pod.Spec.Affinity
 	if priorityMeta, ok := meta.(*priorityMetadata); ok {
+		// We were able to parse metadata, use affinity from there.
 		affinity = priorityMeta.affinity
-	} else {
-		// We couldn't parse metadata - fallback to the podspec.
-		affinity = pod.Spec.Affinity
 	}
 
 	var count int32
@@ -60,7 +59,7 @@ func CalculateNodeAffinityPriorityMap(pod *v1.Pod, meta interface{}, nodeInfo *s
 			// TODO: Avoid computing it for all nodes if this becomes a performance problem.
 			nodeSelector, err := v1helper.NodeSelectorRequirementsAsSelector(preferredSchedulingTerm.Preference.MatchExpressions)
 			if err != nil {
-				return schedulerapi.HostPriority{}, err
+				return framework.NodeScore{}, err
 			}
 			if nodeSelector.Matches(labels.Set(node.Labels)) {
 				count += preferredSchedulingTerm.Weight
@@ -68,11 +67,11 @@ func CalculateNodeAffinityPriorityMap(pod *v1.Pod, meta interface{}, nodeInfo *s
 		}
 	}
 
-	return schedulerapi.HostPriority{
-		Host:  node.Name,
-		Score: int(count),
+	return framework.NodeScore{
+		Name:  node.Name,
+		Score: int64(count),
 	}, nil
 }
 
 // CalculateNodeAffinityPriorityReduce is a reduce function for node affinity priority calculation.
-var CalculateNodeAffinityPriorityReduce = NormalizeReduce(schedulerapi.MaxPriority, false)
+var CalculateNodeAffinityPriorityReduce = NormalizeReduce(framework.MaxNodeScore, false)

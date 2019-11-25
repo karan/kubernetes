@@ -21,8 +21,8 @@ import (
 	"path/filepath"
 
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/kubernetes/pkg/kubelet/apis/kubeletconfig"
-	kubeletscheme "k8s.io/kubernetes/pkg/kubelet/apis/kubeletconfig/scheme"
+	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
+	kubeletscheme "k8s.io/kubernetes/pkg/kubelet/apis/config/scheme"
 	utilcodec "k8s.io/kubernetes/pkg/kubelet/kubeletconfig/util/codec"
 	utilfs "k8s.io/kubernetes/pkg/util/filesystem"
 )
@@ -45,7 +45,7 @@ type fsLoader struct {
 
 // NewFsLoader returns a Loader that loads a KubeletConfiguration from the `kubeletFile`
 func NewFsLoader(fs utilfs.Filesystem, kubeletFile string) (Loader, error) {
-	_, kubeletCodecs, err := kubeletscheme.NewSchemeAndCodecs()
+	_, kubeletCodecs, err := kubeletscheme.NewSchemeAndCodecs(serializer.EnableStrict)
 	if err != nil {
 		return nil, err
 	}

@@ -716,7 +716,7 @@ func (f *Finder) HostSystem(ctx context.Context, path string) (*object.HostSyste
 }
 
 func (f *Finder) DefaultHostSystem(ctx context.Context) (*object.HostSystem, error) {
-	hs, err := f.HostSystem(ctx, "*/*")
+	hs, err := f.HostSystem(ctx, "*")
 	if err != nil {
 		return nil, toDefaultError(err)
 	}
@@ -905,6 +905,12 @@ func (f *Finder) DefaultFolder(ctx context.Context) (*object.Folder, error) {
 		return nil, toDefaultError(err)
 	}
 	folder := object.NewFolder(f.client, ref.Reference())
+
+	// Set the InventoryPath of the newly created folder object
+	// The default foler becomes the datacenter's "vm" folder.
+	// The "vm" folder always exists for a datacenter. It cannot be
+	// removed or replaced
+	folder.SetInventoryPath(path.Join(f.dc.InventoryPath, "vm"))
 
 	return folder, nil
 }

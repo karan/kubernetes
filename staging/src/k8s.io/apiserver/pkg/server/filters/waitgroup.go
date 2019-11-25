@@ -17,32 +17,40 @@ limitations under the License.
 package filters
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 
+	"k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	utilwaitgroup "k8s.io/apimachinery/pkg/util/waitgroup"
+	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/client-go/kubernetes/scheme"
 )
 
 // WithWaitGroup adds all non long-running requests to wait group, which is used for graceful shutdown.
-func WithWaitGroup(handler http.Handler, requestContextMapper apirequest.RequestContextMapper, longRunning apirequest.LongRunningRequestCheck, wg *utilwaitgroup.SafeWaitGroup) http.Handler {
+func WithWaitGroup(handler http.Handler, longRunning apirequest.LongRunningRequestCheck, wg *utilwaitgroup.SafeWaitGroup) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		ctx, ok := requestContextMapper.Get(req)
-		if !ok {
-			// if this happens, the handler chain isn't setup correctly because there is no context mapper
-			handler.ServeHTTP(w, req)
-			return
-		}
-
+		ctx := req.Context()
 		requestInfo, ok := apirequest.RequestInfoFrom(ctx)
 		if !ok {
 			// if this happens, the handler chain isn't setup correctly because there is no request info
-			handler.ServeHTTP(w, req)
+			responsewriters.InternalError(w, req, errors.New("no RequestInfo found in the context"))
 			return
 		}
 
 		if !longRunning(req, requestInfo) {
 			if err := wg.Add(1); err != nil {
-				http.Error(w, "apiserver is shutting down.", http.StatusInternalServerError)
+				// When apiserver is shutting down, signal clients to retry
+				// There is a good chance the client hit a different server, so a tight retry is good for client responsiveness.
+				w.Header().Add("Retry-After", "1")
+				w.Header().Set("Content-Type", runtime.ContentTypeJSON)
+				w.Header().Set("X-Content-Type-Options", "nosniff")
+				statusErr := apierrors.NewServiceUnavailable("apiserver is shutting down").Status()
+				w.WriteHeader(int(statusErr.Code))
+				fmt.Fprintln(w, runtime.EncodeOrDie(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &statusErr))
 				return
 			}
 			defer wg.Done()

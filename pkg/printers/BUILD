@@ -1,72 +1,20 @@
 package(default_visibility = ["//visibility:public"])
 
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-    "go_test",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
-        "customcolumn.go",
-        "customcolumn_flags.go",
-        "flags.go",
-        "humanreadable.go",
-        "humanreadable_flags.go",
         "interface.go",
-        "json.go",
-        "json_yaml_flags.go",
-        "jsonpath.go",
-        "jsonpath_flags.go",
-        "kube_template_flags.go",
-        "name.go",
-        "name_flags.go",
-        "printers.go",
-        "tabwriter.go",
-        "template.go",
-        "template_flags.go",
-        "versioned.go",
+        "tablegenerator.go",
     ],
     importpath = "k8s.io/kubernetes/pkg/printers",
     deps = [
-        "//pkg/kubectl/scheme:go_default_library",
-        "//vendor/github.com/ghodss/yaml:go_default_library",
-        "//vendor/github.com/golang/glog:go_default_library",
-        "//vendor/github.com/spf13/cobra:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/api/meta:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/apis/meta/v1/unstructured:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/apis/meta/v1beta1:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/labels:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime/schema:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/errors:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/runtime:go_default_library",
-        "//vendor/k8s.io/client-go/util/jsonpath:go_default_library",
-    ],
-)
-
-go_test(
-    name = "go_default_xtest",
-    srcs = [
-        "customcolumn_flags_test.go",
-        "customcolumn_test.go",
-        "humanreadable_flags_test.go",
-        "json_yaml_flags_test.go",
-        "jsonpath_flags_test.go",
-        "name_flags_test.go",
-        "template_flags_test.go",
-    ],
-    deps = [
-        ":go_default_library",
-        "//pkg/api/legacyscheme:go_default_library",
-        "//pkg/apis/core:go_default_library",
-        "//pkg/printers/internalversion:go_default_library",
-        "//vendor/k8s.io/api/core/v1:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime/schema:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/api/meta:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/apis/meta/v1beta1:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/runtime:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/util/runtime:go_default_library",
     ],
 )
 
@@ -85,19 +33,4 @@ filegroup(
         "//pkg/printers/storage:all-srcs",
     ],
     tags = ["automanaged"],
-)
-
-go_test(
-    name = "go_default_test",
-    srcs = [
-        "humanreadable_test.go",
-        "template_test.go",
-    ],
-    embed = [":go_default_library"],
-    deps = [
-        "//pkg/apis/core:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/apis/meta/v1beta1:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime:go_default_library",
-    ],
 )

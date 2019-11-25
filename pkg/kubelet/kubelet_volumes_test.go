@@ -21,7 +21,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +37,21 @@ func TestListVolumesForPod(t *testing.T) {
 	kubelet := testKubelet.kubelet
 
 	pod := podWithUIDNameNsSpec("12345678", "foo", "test", v1.PodSpec{
+		Containers: []v1.Container{
+			{
+				Name: "container1",
+				VolumeMounts: []v1.VolumeMount{
+					{
+						Name:      "vol1",
+						MountPath: "/mnt/vol1",
+					},
+					{
+						Name:      "vol2",
+						MountPath: "/mnt/vol2",
+					},
+				},
+			},
+		},
 		Volumes: []v1.Volume{
 			{
 				Name: "vol1",
@@ -74,7 +89,6 @@ func TestListVolumesForPod(t *testing.T) {
 
 	outerVolumeSpecName2 := "vol2"
 	assert.NotNil(t, volumesToReturn[outerVolumeSpecName2], "key %s", outerVolumeSpecName2)
-
 }
 
 func TestPodVolumesExist(t *testing.T) {
@@ -89,6 +103,17 @@ func TestPodVolumesExist(t *testing.T) {
 				UID:  "pod1uid",
 			},
 			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name: "container1",
+						VolumeMounts: []v1.VolumeMount{
+							{
+								Name:      "vol1",
+								MountPath: "/mnt/vol1",
+							},
+						},
+					},
+				},
 				Volumes: []v1.Volume{
 					{
 						Name: "vol1",
@@ -107,6 +132,17 @@ func TestPodVolumesExist(t *testing.T) {
 				UID:  "pod2uid",
 			},
 			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name: "container2",
+						VolumeMounts: []v1.VolumeMount{
+							{
+								Name:      "vol2",
+								MountPath: "/mnt/vol2",
+							},
+						},
+					},
+				},
 				Volumes: []v1.Volume{
 					{
 						Name: "vol2",
@@ -125,6 +161,17 @@ func TestPodVolumesExist(t *testing.T) {
 				UID:  "pod3uid",
 			},
 			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name: "container3",
+						VolumeMounts: []v1.VolumeMount{
+							{
+								Name:      "vol3",
+								MountPath: "/mnt/vol3",
+							},
+						},
+					},
+				},
 				Volumes: []v1.Volume{
 					{
 						Name: "vol3",
@@ -160,6 +207,17 @@ func TestVolumeAttachAndMountControllerDisabled(t *testing.T) {
 	kubelet := testKubelet.kubelet
 
 	pod := podWithUIDNameNsSpec("12345678", "foo", "test", v1.PodSpec{
+		Containers: []v1.Container{
+			{
+				Name: "container1",
+				VolumeMounts: []v1.VolumeMount{
+					{
+						Name:      "vol1",
+						MountPath: "/mnt/vol1",
+					},
+				},
+			},
+		},
 		Volumes: []v1.Volume{
 			{
 				Name: "vol1",
@@ -204,6 +262,17 @@ func TestVolumeUnmountAndDetachControllerDisabled(t *testing.T) {
 	kubelet := testKubelet.kubelet
 
 	pod := podWithUIDNameNsSpec("12345678", "foo", "test", v1.PodSpec{
+		Containers: []v1.Container{
+			{
+				Name: "container1",
+				VolumeMounts: []v1.VolumeMount{
+					{
+						Name:      "vol1",
+						MountPath: "/mnt/vol1",
+					},
+				},
+			},
+		},
 		Volumes: []v1.Volume{
 			{
 				Name: "vol1",
@@ -283,7 +352,6 @@ func TestVolumeAttachAndMountControllerEnabled(t *testing.T) {
 							DevicePath: "fake/path",
 						},
 					}},
-				Spec: v1.NodeSpec{ExternalID: testKubeletHostname},
 			}, nil
 		})
 	kubeClient.AddReactor("*", "*", func(action core.Action) (bool, runtime.Object, error) {
@@ -291,6 +359,17 @@ func TestVolumeAttachAndMountControllerEnabled(t *testing.T) {
 	})
 
 	pod := podWithUIDNameNsSpec("12345678", "foo", "test", v1.PodSpec{
+		Containers: []v1.Container{
+			{
+				Name: "container1",
+				VolumeMounts: []v1.VolumeMount{
+					{
+						Name:      "vol1",
+						MountPath: "/mnt/vol1",
+					},
+				},
+			},
+		},
 		Volumes: []v1.Volume{
 			{
 				Name: "vol1",
@@ -350,7 +429,6 @@ func TestVolumeUnmountAndDetachControllerEnabled(t *testing.T) {
 							DevicePath: "fake/path",
 						},
 					}},
-				Spec: v1.NodeSpec{ExternalID: testKubeletHostname},
 			}, nil
 		})
 	kubeClient.AddReactor("*", "*", func(action core.Action) (bool, runtime.Object, error) {
@@ -358,6 +436,17 @@ func TestVolumeUnmountAndDetachControllerEnabled(t *testing.T) {
 	})
 
 	pod := podWithUIDNameNsSpec("12345678", "foo", "test", v1.PodSpec{
+		Containers: []v1.Container{
+			{
+				Name: "container1",
+				VolumeMounts: []v1.VolumeMount{
+					{
+						Name:      "vol1",
+						MountPath: "/mnt/vol1",
+					},
+				},
+			},
+		},
 		Volumes: []v1.Volume{
 			{
 				Name: "vol1",
@@ -441,11 +530,11 @@ func (f *stubVolume) CanMount() error {
 	return nil
 }
 
-func (f *stubVolume) SetUp(fsGroup *int64) error {
+func (f *stubVolume) SetUp(mounterArgs volume.MounterArgs) error {
 	return nil
 }
 
-func (f *stubVolume) SetUpAt(dir string, fsGroup *int64) error {
+func (f *stubVolume) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
 	return nil
 }
 
@@ -465,6 +554,15 @@ func (f *stubBlockVolume) GetPodDeviceMapPath() (string, string) {
 func (f *stubBlockVolume) SetUpDevice() (string, error) {
 	return "", nil
 }
+
+func (f stubBlockVolume) MapPodDevice() error {
+	return nil
+}
+
 func (f *stubBlockVolume) TearDownDevice(mapPath string, devicePath string) error {
+	return nil
+}
+
+func (f *stubBlockVolume) UnmapPodDevice() error {
 	return nil
 }
